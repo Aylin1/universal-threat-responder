@@ -1,22 +1,23 @@
-from langchain.agents import initialize_agent, Tool
-from langchain.llms import OpenAI
-import os
 import json
 import logging
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, TypedDict
+
+from langchain_core.language_models import BaseChatModel
+from langgraph.graph import StateGraph, END
 from src.domain_interface import ThreatSignal, DecisionOutput, DomainAdapter
 
 logger = logging.getLogger(__name__)
 
+
 class SecurityTools:
     """Domain-agnostic action execution."""
-    
+
     def __init__(self, audit_log_path: str = 'logs/audit.log'):
         self.audit_log_path = audit_log_path
         Path(audit_log_path).parent.mkdir(exist_ok=True)
-        
         self.stats = {
             'blocked': 0,
             'flagged': 0,
@@ -24,35 +25,45 @@ class SecurityTools:
             'retrains_triggered': 0,
             'errors': 0
         }
-    
+
     def block(self, signal_id: str, reason: str) -> str:
         audit_id = str(uuid.uuid4())
         self._log_audit(signal_id, "BLOCK", reason, audit_id)
         self.stats['blocked'] += 1
         return audit_id
-    
-    def flag(self, signal_id: str, reason: str, priority: str) -> str:
+
+    def flag(self,
+             signal_id: str,
+             reason: str,
+             priority: str = "medium") -> str:
         audit_id = str(uuid.uuid4())
-        self._log_audit(signal_id, "FLAG", reason, audit_id)
+        self._log_audit(signal_id, "FLAG", f"{reason} (Priority: {priority})",
+                        audit_id)
         self.stats['flagged'] += 1
         return audit_id
-    
+
     def allow(self, signal_id: str, confidence: float) -> str:
         audit_id = str(uuid.uuid4())
-        self._log_audit(signal_id, "ALLOW", f"confidence={confidence:.2%}", audit_id)
+        self._log_audit(signal_id, "ALLOW", f"confidence={confidence:.2%}",
+                        audit_id)
         self.stats['allowed'] += 1
         return audit_id
-    
-    def trigger_retrain(self, signal_id: str, reason: str, urgency: str) -> str:
+
+    def trigger_retrain(self,
+                        signal_id: str,
+                        reason: str,
+                        urgency: str = "normal") -> str:
         audit_id = str(uuid.uuid4())
-        self._log_audit(signal_id, "RETRAIN", reason, audit_id)
+        self._log_audit(signal_id, "RETRAIN", f"{reason} (Urgency: {urgency})",
+                        audit_id)
         self.stats['retrains_triggered'] += 1
         return audit_id
-    
-    def _log_audit(self, signal_id: str, action: str, details: str, audit_id: str):
+
+    def _log_audit(self, signal_id: str, action: str, details: str,
+                   audit_id: str):
         entry = {
             'audit_id': audit_id,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'signal_id': signal_id,
             'action': action,
             'details': details
@@ -60,181 +71,135 @@ class SecurityTools:
         with open(self.audit_log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
         return audit_id
-    
-    def get_stats(self):
-        return self.stats.copy()
 
 
-class ThreatResponderAgent:
-    """
-    Universal LLM-based decision agent.
-    Works with ANY domain adapter that implements DomainAdapter interface.
-    """
-    
-    def __init__(self, tools: SecurityTools = None, 
-                 llm_api_key: str = None, temperature: float = 0.1):
+# State schema for the LangGraph state machine
+class AgentState(TypedDict):
+    signal: ThreatSignal
+    adapter: DomainAdapter
+    formatted_prompt: str
+    raw_response: str
+    action: str
+    reasoning: str
+    audit_id: str
+    latency_ms: float
+    error: Optional[str]
+
+
+class ThreatResponderGraph:
+    """Stateful LangGraph agent for threat evaluation and action routing."""
+
+    def __init__(self,
+                 llm: BaseChatModel,
+                 tools: Optional[SecurityTools] = None):
+        self.llm = llm
         self.tools = tools or SecurityTools()
-        
-        if llm_api_key:
-            os.environ['OPENAI_API_KEY'] = llm_api_key
-        
-        self.llm = OpenAI(
-            temperature=temperature,
-            model_name="gpt-3.5-turbo-instruct",
-            max_tokens=250
-        )
-        
-        self._setup_tools()
-        self.agent = initialize_agent(
-            self.tool_list,
-            self.llm,
-            agent="zero-shot-react-description",
-            verbose=False
-        )
-    
-    def _setup_tools(self):
-        self.tool_list = [
-            Tool(
-                name="Block Signal",
-                func=lambda args: self.tools.block(**args),
-                description="Block high-risk signal. Args: signal_id, reason."
-            ),
-            Tool(
-                name="Flag for Review",
-                func=lambda args: self.tools.flag(**args),
-                description="Flag suspicious signal for human review. Args: signal_id, reason, priority."
-            ),
-            Tool(
-                name="Allow",
-                func=lambda args: self.tools.allow(**args),
-                description="Allow low-risk signal. Args: signal_id, confidence."
-            ),
-            Tool(
-                name="Trigger Retrain",
-                func=lambda args: self.tools.trigger_retrain(**args),
-                description="Schedule model retraining. Args: signal_id, reason, urgency."
-            )
-        ]
-    
-    def respond(self, signal: ThreatSignal, adapter: DomainAdapter) -> DecisionOutput:
-        """
-        Main decision method. Works with any domain adapter.
-        
-        Args:
-            signal: Domain-agnostic threat signal
-            adapter: Domain-specific adapter for context building
-        
-        Returns:
-            DecisionOutput with standardized action and metadata
-        """
-        # Build domain-specific prompt
-        prompt_template = adapter.get_prompt_template() or self._default_prompt
-        prompt = self._build_prompt(signal, adapter, prompt_template)
-        
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        builder = StateGraph(AgentState)
+
+        builder.add_node("build_prompt", self._node_build_prompt)
+        builder.add_node("evaluate_threat", self._node_evaluate_threat)
+        builder.add_node("parse_action", self._node_parse_action)
+        builder.add_node("execute_action", self._node_execute_action)
+        builder.add_node("fallback_handler", self._node_fallback_handler)
+
+        builder.set_entry_point("build_prompt")
+        builder.add_edge("build_prompt", "evaluate_threat")
+
+        builder.add_conditional_edges(
+            "evaluate_threat", lambda state: "fallback_handler"
+            if state.get("error") else "parse_action", {
+                "fallback_handler": "fallback_handler",
+                "parse_action": "parse_action"
+            })
+
+        builder.add_edge("parse_action", "execute_action")
+        builder.add_edge("execute_action", END)
+        builder.add_edge("fallback_handler", END)
+
+        return builder.compile()
+
+    def _node_build_prompt(self, state: AgentState) -> Dict[str, Any]:
+        adapter = state["adapter"]
+        signal = state["signal"]
+        template = adapter.get_prompt_template()
+        prompt_text = template(signal,
+                               adapter) if callable(template) else template
+        return {"formatted_prompt": prompt_text}
+
+    def _node_evaluate_threat(self, state: AgentState) -> Dict[str, Any]:
+        from time import perf_counter
+        start = perf_counter()
         try:
-            from time import perf_counter
-            start = perf_counter()
-            
-            # Get agent decision
-            response = self.agent.run(prompt)
-            
-            # Parse and execute
-            action = self._parse_action(response)
-            audit_id = self._execute_action(signal.signal_id, signal.risk_score, 
-                                          signal.confidence, action)
-            
+            response = self.llm.invoke(state["formatted_prompt"])
+            response_text = getattr(response, "content", str(response))
             latency = (perf_counter() - start) * 1000
-            
-            return DecisionOutput(
-                action=action,
-                reasoning=response[:200],
-                audit_id=audit_id,
-                latency_ms=round(latency, 2),
-                metadata={'domain': adapter.domain_name}
-            )
+            return {
+                "raw_response": response_text,
+                "latency_ms": latency,
+                "error": None
+            }
         except Exception as e:
-            logger.warning(f"Agent failed, using fallback: {e}")
-            return self._fallback_decision(signal, adapter, str(e))
-    
-    def _default_prompt(self, signal: ThreatSignal, adapter: DomainAdapter) -> str:
-        ctx_lines = "\n".join(f"  - {k}: {v}" for k, v in signal.context.items()[:8])
-        return f"""
-You are an autonomous security response agent for {adapter.domain_description}.
+            return {"error": str(e), "latency_ms": 0}
 
-THREAT ANALYSIS:
-- Risk Score: {signal.risk_score:.2%}
-- Model Confidence: {signal.confidence:.2f}
-- Domain: {adapter.domain_name}
-- Signal ID: {signal.signal_id}
-- Context:
-{ctx_lines}
-
-Available Actions:
-1. BLOCK    - High risk ({adapter.domain_name}), act immediately
-2. FLAG     - Moderate risk, escalate for human review
-3. ALLOW    - Low risk, permit normal operation
-4. RETRAIN  - Systemic issue detected, schedule model update
-
-Choose action with reasoning.
-Format:
-ACTION: [BLOCK|FLAG|ALLOW|RETRAIN]
-REASONING: [one sentence]
-"""
-    
-    def _build_prompt(self, signal: ThreatSignal, adapter: DomainAdapter, 
-                     prompt_template: callable) -> str:
-        if callable(prompt_template):
-            return prompt_template(signal, adapter)
-        return prompt_template
-    
-    def _parse_action(self, response: str) -> str:
-        response_lower = response.lower()
-        
-        if 'block' in response_lower:
-            return 'BLOCK'
-        elif 'flag' in response_lower:
-            return 'FLAG'
-        elif 'allow' in response_lower:
-            return 'ALLOW'
-        elif 'retrain' in response_lower:
-            return 'RETRAIN'
-        else:
-            return 'FLAG'  # Safe default
-    
-    def _execute_action(self, signal_id: str, risk: float, 
-                       confidence: float, action: str) -> str:
-        if action == 'BLOCK':
-            return self.tools.block(signal_id, f"HIGH RISK ({risk:.2%})")
-        elif action == 'FLAG':
-            priority = 'high' if risk > 0.85 else 'medium'
-            return self.tools.flag(signal_id, f"Moderate risk ({risk:.2%})", priority)
-        elif action == 'ALLOW':
-            return self.tools.allow(signal_id, 1 - risk)
-        elif action == 'RETRAIN':
-            return self.tools.trigger_retrain(signal_id, "Performance degradation", "normal")
-        else:
-            return self.tools.flag(signal_id, "Unknown action, defaulting", "low")
-    
-    def _fallback_decision(self, signal: ThreatSignal, adapter: DomainAdapter, 
-                          error_msg: str) -> DecisionOutput:
-        """Deterministic rules if LLM agent fails."""
-        if signal.risk_score > 0.90:
+    def _node_parse_action(self, state: AgentState) -> Dict[str, Any]:
+        resp = state["raw_response"].lower()
+        if 'block' in resp:
             action = 'BLOCK'
-        elif signal.risk_score > 0.70 or signal.confidence < 0.60:
-            action = 'FLAG'
-        else:
+        elif 'allow' in resp:
             action = 'ALLOW'
-        
-        audit_id = self._execute_action(signal.signal_id, signal.risk_score, 
-                                       signal.confidence, action)
-        
-        return DecisionOutput(
-            action=action,
-            reasoning=f"Fallback due to agent error: {error_msg[:50]}",
-            audit_id=audit_id,
-            latency_ms=0,
-            metadata={'domain': adapter.domain_name, 'fallback': True}
-        )
-    
-    def get_stats(self):
-        return self.tools.get_stats()
+        elif 'retrain' in resp:
+            action = 'RETRAIN'
+        else:
+            action = 'FLAG'
+        return {"action": action, "reasoning": state["raw_response"]}
+
+    def _node_execute_action(self, state: AgentState) -> Dict[str, Any]:
+        sig = state["signal"]
+        act = state["action"]
+        if act == 'BLOCK':
+            audit_id = self.tools.block(sig.signal_id,
+                                        f"HIGH RISK ({sig.risk_score:.2%})")
+        elif act == 'ALLOW':
+            audit_id = self.tools.allow(sig.signal_id, 1.0 - sig.risk_score)
+        elif act == 'RETRAIN':
+            audit_id = self.tools.trigger_retrain(sig.signal_id,
+                                                  "Performance degradation")
+        else:
+            audit_id = self.tools.flag(
+                sig.signal_id, f"Moderate risk ({sig.risk_score:.2%})")
+        return {"audit_id": audit_id}
+
+    def _node_fallback_handler(self, state: AgentState) -> Dict[str, Any]:
+        sig = state["signal"]
+        act = 'BLOCK' if sig.risk_score > 0.90 else (
+            'FLAG' if sig.risk_score > 0.70 else 'ALLOW')
+        audit_id = self.tools.flag(
+            sig.signal_id, f"Fallback due to error: {state.get('error')}")
+        return {
+            "action": act,
+            "reasoning":
+            f"Fallback executed due to error: {state.get('error')}",
+            "audit_id": audit_id
+        }
+
+    def respond(self, signal: ThreatSignal,
+                adapter: DomainAdapter) -> DecisionOutput:
+        initial_state = {
+            "signal": signal,
+            "adapter": adapter,
+            "formatted_prompt": "",
+            "raw_response": "",
+            "action": "",
+            "reasoning": "",
+            "audit_id": "",
+            "latency_ms": 0.0,
+            "error": None
+        }
+        final_state = self.graph.invoke(initial_state)
+        return DecisionOutput(action=final_state["action"],
+                              reasoning=final_state["reasoning"],
+                              audit_id=final_state["audit_id"],
+                              latency_ms=final_state["latency_ms"])

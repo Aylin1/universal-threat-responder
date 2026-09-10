@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict
-from datetime import datetime
+from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+
 
 @dataclass
 class ThreatSignal:
@@ -9,27 +10,28 @@ class ThreatSignal:
     Domain-agnostic representation of a threat event.
     Each adapter transforms raw input into this format.
     """
-    signal_id: str                           # Unique identifier
-    risk_score: float                        # 0.0–1.0 from ML model
-    confidence: float                        # Model confidence
-    context: Dict[str, Any]                  # Domain-specific metadata
-    raw_payload: Any                         # Original input preserved
-    timestamp: datetime = None               # Auto-filled if None
-    
+    signal_id: str                          # Unique identifier
+    risk_score: float                       # 0.0–1.0 from ML model
+    confidence: float                       # Model confidence
+    context: Dict[str, Any]                 # Domain-specific metadata
+    domain: str = "spam_phishing"           # Domain identifier
+    raw_payload: Any = None                 # Preserved original input (optional)
+    timestamp: Optional[datetime] = None    # Auto-filled UTC timestamp
+
     def __post_init__(self):
         if self.timestamp is None:
-            self.timestamp = datetime.utcnow()
+            self.timestamp = datetime.now(timezone.utc)
 
 
 @dataclass
 class DecisionOutput:
     """Standardized agent response."""
-    action: str                              # BLOCK | FLAG | ALLOW | RETRAIN
-    reasoning: str                           # Natural language explanation
-    audit_id: str                            # Traceable log entry
-    latency_ms: float                        # Decision time
-    metadata: Dict[str, Any] = None          # Additional context
-    
+    action: str                             # BLOCK | FLAG | ALLOW | RETRAIN
+    reasoning: str                          # Natural language explanation
+    audit_id: str                           # Traceable log entry
+    latency_ms: float                       # Decision execution time
+    metadata: Dict[str, Any] = None         # Additional context
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
@@ -38,45 +40,36 @@ class DecisionOutput:
 class DomainAdapter(ABC):
     """
     Base class for domain-specific adapters.
-    Implement these three methods to plug in any new domain.
+    Implement these methods to plug in any new threat domain.
     """
-    
+
     @property
     @abstractmethod
     def domain_name(self) -> str:
-        """Human-readable domain identifier (e.g., 'email_spam')."""
+        """Human-readable domain identifier (e.g., 'spam_phishing')."""
         pass
-    
+
     @property
     @abstractmethod
     def domain_description(self) -> str:
-        """Brief description for agent prompts."""
+        """Brief description for agent system prompts."""
         pass
-    
+
     @abstractmethod
     def extract_features(self, raw: Any) -> Any:
-        """
-        Transform raw input → feature vector for ML model.
-        Return: (X_vectorizer_fitted, X_struct_array, vectorizer_object)
-        """
+        """Transform raw input into feature representation."""
         pass
-    
+
     @abstractmethod
     def build_context(self, raw: Any, metadata: Dict = None) -> Dict[str, Any]:
-        """
-        Build domain-specific metadata dict for agent prompt.
-        Return: Dictionary with meaningful keys for decision context.
-        """
+        """Build domain-specific metadata dictionary for agent context."""
         pass
-    
+
     @abstractmethod
     def validate_input(self, raw: Any) -> bool:
-        """
-        Check if input meets minimum quality requirements.
-        Raise ValueError if invalid.
-        """
+        """Check if raw input meets minimum requirements."""
         pass
-    
-    def get_prompt_template(self) -> str:
-        """Override for custom agent prompt wording."""
-        return None  # Use default universal prompt
+
+    def get_prompt_template(self) -> Optional[Any]:
+        """Override for domain-customized prompt template/function."""
+        return None
