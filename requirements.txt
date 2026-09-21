@@ -1,4 +1,4 @@
-# ML Core
+# ML Core & Analytics
 scikit-learn>=1.3.0
 lightgbm>=4.0.0
 numpy>=1.24.0
@@ -6,18 +6,33 @@ pandas>=2.0.0
 scipy>=1.11.0
 joblib>=1.3.0
 
-# LLM Agent
-langchain>=0.0.350
-openai>=1.3.0
+# LLM, LangGraph & Vector RAG Engine
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-ollama>=0.1.0
+langchain-milvus>=0.1.0
+langchain-huggingface>=0.0.1
+langgraph>=0.0.20
+pymilvus>=2.3.0
 
-# API & Web
+# Interactive Telemetry Dashboard
+streamlit>=1.30.0
+
+# Multi-Engine PDF Processing & OCR Pipeline
+pymupdf>=1.23.0
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+rapidocr-onnxruntime>=1.3.0
+
+# Feed Ingestion & Networking
+requests>=2.31.0
+
+# API & Web Services
 fastapi>=0.104.0
 uvicorn>=0.24.0
 python-multipart>=0.0.6
 
-# Monitoring
+# Monitoring & Testing
 prometheus-client>=0.18.0
-
-# Testing
 pytest>=7.4.0
 pyyaml>=6.0
