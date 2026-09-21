@@ -11,10 +11,10 @@ The system normalizes threat signals across security domains — combining phish
 1. [Key Features](#key-features)
 2. [System Architecture](#system-architecture)
 3. [Project Structure](#project-structure)
-4. [Setup & Quickstart](#setup--quickstart)
+4. [Interactive Dashboard & Execution Example](#interactive-dashboard--execution-example)
 5. [Benchmark & Telemetry Results](#benchmark--telemetry-results)
-6. [Extending to a New Domain](#extending-to-a-new-domain)
-7. [Roadmap](#roadmap)
+6. [Roadmap](#roadmap)
+7. [Setup & Quickstart](#setup--quickstart)
 
 ---
 
