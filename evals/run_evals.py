@@ -1,6 +1,7 @@
 import argparse
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 import pandas as pd
 from sklearn.metrics import precision_score, recall_score, f1_score
@@ -29,6 +30,16 @@ def run_evaluation():
     parser.add_argument("--sample-fraction", type=float, help="Fraction of dataset to test")
     parser.add_argument("--dataset-path", type=str, help="Override JSON/CSV dataset path")
     args = parser.parse_args()
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    # Give every evaluation run its own audit log.
+    audit_log_path = Path(cfg.paths.audit_log_path)
+    cfg.paths.audit_log_path = str(
+        audit_log_path.with_name(
+            f"{audit_log_path.stem}_{run_id}{audit_log_path.suffix}"
+        )
+    )
 
     if args.disable_fast_path:
         cfg.conformal.use_fast_path = False
@@ -94,7 +105,10 @@ def run_evaluation():
 
         context = adapter.build_context(
             raw_input=email_text,
-            metadata={"source": "enron_eval"}
+            metadata={
+                "source": "enron_eval",
+                "sample_count": len(test_items),
+            }
         )
         signal = item["signal_builder"](context)
 
@@ -184,7 +198,7 @@ def run_evaluation():
         print(f"F1-Score (Macro 3-Class):           {f1:.3f}")
     print("=" * 60)
 
-    output_path = Path("evals/live_audit_report_results.csv")
+    output_path = Path("evals") / f"live_audit_report_results_{run_id}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(output_path, index=False)
     print(f"Saved detailed telemetry log to `{output_path}`")

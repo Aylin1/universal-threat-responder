@@ -1,4 +1,8 @@
 import io
+import json
+import csv
+import hashlib
+import inspect
 import random
 import streamlit as st
 
@@ -26,6 +30,11 @@ st.markdown("Test your threat intelligence and classification engine interactive
 
 @st.cache_resource
 def load_threat_engine():
+    min_samples_for_fast_path = getattr(
+        cfg.conformal,
+        "min_samples_for_fast_path",
+        5,
+    )
     adapter = RAGSpamAdapter(
         milvus_uri=cfg.vector_store.uri,
         collection_name=getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
@@ -36,11 +45,17 @@ def load_threat_engine():
         keep_alive=cfg.llm.keep_alive
     )
     tools = SecurityTools(audit_log_path=cfg.paths.audit_log_path)
+    graph_kwargs = {
+        "llm": llm,
+        "tools": tools,
+        "confidence_threshold": cfg.llm.confidence_threshold,
+        "use_fast_path": cfg.conformal.use_fast_path,
+    }
+    if "min_samples_for_fast_path" in inspect.signature(ThreatResponderGraph).parameters:
+        graph_kwargs["min_samples_for_fast_path"] = min_samples_for_fast_path
+
     graph = ThreatResponderGraph(
-        llm=llm,
-        tools=tools,
-        confidence_threshold=cfg.llm.confidence_threshold,
-        use_fast_path=cfg.conformal.use_fast_path
+        **graph_kwargs,
     )
     return adapter, graph
 
@@ -106,98 +121,264 @@ def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
 
     return ""
 
-with st.spinner("Initializing Milvus vector database and local LLM graph..."):
+def parse_json_samples(raw_bytes: bytes) -> list[dict]:
+    data = json.loads(raw_bytes.decode("utf-8-sig"))
+
+    if isinstance(data, dict):
+        data = data.get("samples", data.get("data", [data]))
+
+    if not isinstance(data, list):
+        data = [data]
+
+    samples = []
+    for index, item in enumerate(data, start=1):
+        if isinstance(item, str):
+            text = item
+            metadata = {}
+        else:
+            text = (
+                item.get("text")
+                or item.get("email")
+                or item.get("payload")
+                or item.get("raw_payload")
+                or ""
+            )
+            metadata = item
+
+        if str(text).strip():
+            samples.append({
+                "id": f"sample-{index}",
+                "text": str(text).strip(),
+                "metadata": metadata,
+            })
+
+    return samples
+
+
+def parse_csv_samples(raw_bytes: bytes) -> list[dict]:
+    content = raw_bytes.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(io.StringIO(content))
+
+    samples = []
+    for index, row in enumerate(reader, start=1):
+        text = (
+            row.get("text")
+            or row.get("email")
+            or row.get("payload")
+            or row.get("raw_payload")
+            or next(iter(row.values()), "")
+        )
+
+        if str(text).strip():
+            samples.append({
+                "id": f"sample-{index}",
+                "text": str(text).strip(),
+                "metadata": dict(row),
+            })
+
+    return samples
+
+with st.spinner("Loading threat detection model and vector store..."):
     adapter, agent = load_threat_engine()
 
-# Sidebar Telemetry View
-st.sidebar.header("Engine Telemetry Configuration")
-st.sidebar.text(f"Fast-Path Enabled: {cfg.conformal.use_fast_path}")
-st.sidebar.text(f"Conformal Bounds: [{cfg.conformal.low_bound}, {cfg.conformal.high_bound}]")
-st.sidebar.text(f"Model: {cfg.llm.model_name}")
+st.sidebar.text(
+    "Fast path disabled."
+    if not cfg.conformal.use_fast_path
+    else "Fast path enabled."
+)
+st.sidebar.text(f"Detection model: {cfg.llm.model_name}")
 
 email_text = ""
+samples = []
 
 # Input Navigation Tabs
 input_tab1, input_tab2, input_tab3 = st.tabs([
     "📝 Text Paste", 
     "📄 PDF Document Upload", 
-    "📁 Text File Upload"
+    "📊 JSON / CSV / Text Batch Upload"
 ])
 
 with input_tab1:
-    pasted_text = st.text_area("Paste raw email or threat payload text here:", height=250, key="pasted_input")
-    if pasted_text:
-        email_text = pasted_text.strip()
+    pasted_text = st.text_area(
+        "Paste raw email or threat payload text here:",
+        height=250,
+        key="pasted_input",
+    )
+
+    if pasted_text.strip():
+        samples = [{
+            "id": "pasted-input",
+            "text": pasted_text.strip(),
+            "metadata": {"source": "text_paste"},
+        }]
 
 with input_tab2:
-    uploaded_pdf = st.file_uploader("Upload threat report or email PDF", type=["pdf"], key="pdf_uploader")
+    uploaded_pdf = st.file_uploader(
+        "Upload threat report or email PDF",
+        type=["pdf"],
+        key="pdf_uploader",
+    )
+
     if uploaded_pdf is not None:
-        raw_bytes = uploaded_pdf.getvalue()
-        email_text = extract_pdf_text_diagnostic(raw_bytes)
-        if not email_text:
-            st.error("⚠️ Extraction Failed: Document text could not be extracted.")
+        extracted_text = extract_pdf_text_diagnostic(uploaded_pdf.getvalue())
+
+        if extracted_text:
+            samples = [{
+                "id": uploaded_pdf.name,
+                "text": extracted_text,
+                "metadata": {
+                    "source": "pdf_upload",
+                    "filename": uploaded_pdf.name,
+                },
+            }]
+        else:
+            st.error("⚠️ Could not extract text from the PDF.")
 
 with input_tab3:
-    uploaded_txt = st.file_uploader("Upload plain text file", type=["txt"], key="txt_uploader")
-    if uploaded_txt is not None:
+    uploaded_batch = st.file_uploader(
+        "Upload JSON, CSV, or TXT file",
+        type=["json", "csv", "txt"],
+        key="batch_uploader",
+    )
+
+    if uploaded_batch is not None:
+        raw_bytes = uploaded_batch.getvalue()
+        file_type = uploaded_batch.name.lower().rsplit(".", 1)[-1]
+
         try:
-            email_text = uploaded_txt.read().decode("utf-8", errors="ignore").strip()
-        except Exception as e:
-            st.error(f"Error reading text file: {e}")
+            if file_type == "json":
+                samples = parse_json_samples(raw_bytes)
+            elif file_type == "csv":
+                samples = parse_csv_samples(raw_bytes)
+            else:
+                text = raw_bytes.decode("utf-8-sig", errors="ignore").strip()
+                samples = [{
+                    "id": uploaded_batch.name,
+                    "text": text,
+                    "metadata": {
+                        "source": "text_upload",
+                        "filename": uploaded_batch.name,
+                    },
+                }] if text else []
+
+            st.success(f"Loaded {len(samples)} sample(s).")
+        except Exception as error:
+            st.error(f"Failed to parse input file: {error}")
 
 st.markdown("---")
-submitted = st.button("🚀 Analyze Threat Signal", type="primary")
 
-# Execution block after button click
-if submitted:
-    if not email_text:
-        st.warning("Please provide input text, upload a valid PDF document, or upload a text file first.")
+if samples:
+    st.caption(f"{len(samples)} sample(s) ready for analysis.")
+    st.dataframe(
+        [{"ID": item["id"], "Preview": item["text"][:150]} for item in samples],
+        use_container_width=True,
+    )
+
+submitted = st.button("🚀 Analyze Threat Signal(s)", type="primary")
+
+upload_signature = None
+if uploaded_pdf is not None:
+    upload_signature = hashlib.sha256(uploaded_pdf.getvalue()).hexdigest()
+elif uploaded_batch is not None:
+    upload_signature = hashlib.sha256(uploaded_batch.getvalue()).hexdigest()
+
+new_upload = (
+    upload_signature is not None
+    and upload_signature != st.session_state.get("last_analyzed_upload")
+)
+analyze_requested = submitted or new_upload
+
+if analyze_requested:
+    if not samples:
+        st.warning("Please provide text or upload a valid input file first.")
     else:
-        with st.spinner("Executing RAG retrieval and decision graph workflow..."):
-            context = adapter.build_context(
-                raw_input=email_text,
-                metadata={"source": "streamlit_ui"}
-            )
-            
-            signal = ThreatSignal(
-                signal_id=f"ST-{random.randint(100000, 999999)}",
-                domain="spam_phishing",
-                raw_payload=email_text,
-                risk_score=context.get("max_risk_score", 0.50),
-                confidence=0.85,
-                context=context
-            )
-            
-            decision = agent.respond(signal=signal, adapter=adapter)
-            
-            st.markdown("---")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric(label="Decision Action", value=decision.action)
-            with col2:
-                st.metric(label="Confidence Score", value=f"{decision.confidence:.2%}" if decision.confidence else "N/A")
-            with col3:
-                st.metric(label="Max Threat Risk", value=f"{context.get('max_risk_score', 0.0):.2f}")
-            with col4:
-                st.metric(label="Latency", value=f"{decision.latency_ms:.2f} ms")
-            
-            st.subheader("🔍 Agent Reasoning & Audit Trace")
-            st.info(decision.reasoning)
-            
-            with st.expander("View Detailed Telemetry & Retrieved Threat Signatures"):
+        results = []
+
+        with st.spinner(f"Analyzing {len(samples)} sample(s)..."):
+            for index, sample in enumerate(samples, start=1):
+                try:
+                    context = adapter.build_context(
+                        raw_input=sample["text"],
+                        metadata={
+                            "source": "streamlit_ui",
+                            "sample_id": sample["id"],
+                            "sample_count": len(samples),
+                            **sample.get("metadata", {}),
+                        },
+                    )
+
+                    signal = ThreatSignal(
+                        signal_id=f"ST-{random.randint(100000, 999999)}",
+                        domain="spam_phishing",
+                        raw_payload=sample["text"],
+                        risk_score=context.get("max_risk_score", 0.50),
+                        confidence=0.85,
+                        context=context,
+                    )
+
+                    decision = agent.respond(signal=signal, adapter=adapter)
+
+                    results.append({
+                        "Sample": sample["id"],
+                        "Action": decision.action,
+                        "Confidence": decision.confidence,
+                        "Risk": context.get("max_risk_score", 0.0),
+                        "Latency (ms)": decision.latency_ms,
+                        "Decision": decision,
+                        "Context": context,
+                    })
+
+                except Exception as error:
+                    results.append({
+                        "Sample": sample["id"],
+                        "Action": "ERROR",
+                        "Confidence": 0.0,
+                        "Risk": 0.0,
+                        "Latency (ms)": 0.0,
+                        "Error": str(error),
+                    })
+
+        st.subheader("📊 Batch Analysis Results")
+
+        st.dataframe(
+            [
+                {
+                    "Sample": result["Sample"],
+                    "Action": result["Action"],
+                    "Confidence": f'{result["Confidence"]:.2%}',
+                    "Risk": f'{result["Risk"]:.2f}',
+                    "Latency (ms)": f'{result["Latency (ms)"]:.2f}',
+                }
+                for result in results
+            ],
+            use_container_width=True,
+        )
+
+        for result in results:
+            with st.expander(f'🔍 {result["Sample"]} — {result["Action"]}'):
+                if "Error" in result:
+                    st.error(result["Error"])
+                    continue
+
+                decision = result["Decision"]
+                context = result["Context"]
+
+                st.info(decision.reasoning)
                 st.write(f"**Audit ID:** `{decision.audit_id}`")
-                st.write(f"**High-Risk Threat Matches:** `{context.get('high_risk_hits', 0)}`")
-                
-                st.write("**Retrieved Threat Intelligence Indicators:**")
-                retrieved_matches = context.get("retrieved_matches", [])
-                if retrieved_matches:
-                    st.dataframe(retrieved_matches)
+                st.write(f"**High-Risk Matches:** `{context.get('high_risk_hits', 0)}`")
+
+                st.write("**Retrieved Threat Intelligence:**")
+                matches = context.get("retrieved_matches", [])
+                if matches:
+                    st.dataframe(matches, use_container_width=True)
                 else:
-                    st.write("No matching threat intelligence signatures retrieved.")
-                
-                st.write("**Evaluated Standard Operating Procedures (SOPs):**")
+                    st.write("No matching threat intelligence signatures.")
+
+                st.write("**Retrieved Policies:**")
                 st.write(context.get("retrieved_policies", []))
-                
-                st.write("**Raw Decision Metadata:**")
+
+                st.write("**Decision Metadata:**")
                 st.json(decision.metadata)
+
+        if new_upload:
+            st.session_state.last_analyzed_upload = upload_signature
