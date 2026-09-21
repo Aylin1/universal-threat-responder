@@ -20,7 +20,7 @@ class ThreatFeedsConfig:
 
 @dataclass
 class FastPathConformalConfig:
-    use_fast_path: bool = True  # Default enabled matching README benchmark runs
+    use_fast_path: bool = False  # Default enabled matching README benchmark runs
     high_bound: float = 0.95    # Fast-path AUTO-BLOCK threshold (risk_score >= high_bound)
     low_bound: float = 0.05     # Fast-path AUTO-ALLOW threshold (risk_score <= low_bound)
 
