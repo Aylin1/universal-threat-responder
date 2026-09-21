@@ -1,20 +1,44 @@
 import os
-from typing import Dict, Any
-from langchain_chroma import Chroma
+import re
+import math
+from typing import Dict, Any, List
+from langchain_milvus import Milvus
 from langchain_huggingface import HuggingFaceEmbeddings
+
 from src.domain_interface import DomainAdapter, ThreatSignal
 
+MIN_RELEVANT_SIMILARITY = 0.10
+
+DEFAULT_POLICIES = [
+    "SOP-101: ALLOW legitimate corporate correspondence, benign newsletters, and verifiable automated alerts.",
+    "SOP-102: QUARANTINE unsolicited bulk commercial email, promotional marketing, or high-volume spam.",
+    "SOP-103: BLOCK active phishing links, credential harvesting attempts, or malicious payload URLs.",
+    "SOP-104: BLOCK recruitment fraud, task scams, and social engineering vectors (e.g., post-rejection practicum/bootcamp pivots or fake HR onboarding)."
+]
+
+def compute_shannon_entropy(p: float) -> float:
+    p = max(1e-6, min(1.0 - 1e-6, float(p)))
+    return - (p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p))
+
 class RAGSpamAdapter(DomainAdapter):
-
-    def __init__(self, vector_db_path: str = "data/chroma_db"):
+    def __init__(
+        self, 
+        milvus_uri: str = "./data/milvus_threat_intel.db",
+        collection_name: str = "phishing_threat_intel"
+    ):
         self._domain_name = "spam_phishing"
-        self._domain_description = "Vector-backed RAG adapter for email spam, phishing, and scam detection."
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self._domain_description = "Milvus-backed RAG threat intelligence adapter for email, phishing, and social engineering."
 
-        os.makedirs(vector_db_path, exist_ok=True)
-        self.vector_store = Chroma(
-            persist_directory=vector_db_path,
-            embedding_function=self.embeddings
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-en-v1.5",
+            encode_kwargs={"normalize_embeddings": True}
+        )
+
+        os.makedirs(os.path.dirname(milvus_uri), exist_ok=True)
+        self.vector_store = Milvus(
+            embedding_function=self.embeddings,
+            collection_name=collection_name,
+            connection_args={"uri": milvus_uri}
         )
 
     @property
@@ -28,88 +52,141 @@ class RAGSpamAdapter(DomainAdapter):
     def validate_input(self, raw: Any) -> bool:
         return isinstance(raw, str) and len(raw.strip()) > 0
 
-    import re
+    def extract_features(self, raw: Any) -> Any:
+        return str(raw)
 
-    def extract_features(self, raw: Any) -> Dict[str, Any]:
-        raw_str = str(raw)
-        raw_lower = raw_str.lower()
+    def _extract_search_query(self, raw_input: str) -> str:
+        urls = re.findall(r'https?://[^\s]+', raw_input)
         
-        # Catch links or domain references
-        has_urls = any(indicator in raw_lower for indicator in ["http://", "https://", "www.", ".com/", "click here"])
+        subject_match = re.search(r'Subject:\s*(.*)', raw_input, re.IGNORECASE)
+        subject = subject_match.group(1).strip() if subject_match else ""
 
-        # Broader spam indicators
-        spam_keywords = [
-            "urgent", "immediate", "free", "click here", "buy now", "discount",
-            "$", "100%", "guaranteed", "unsubscribe", "winner", "prize",
-            "lottery", "verify", "account", "limited time", "offer", "cheap",
-            "prescription", "viagra", "pills", "mortgage", "refinance", "investment"
-        ]
+        query_components = []
+        if subject:
+            query_components.append(f"Subject: {subject}")
+        if urls:
+            query_components.append(" ".join(urls[:3]))
         
-        has_urgency = any(w in raw_lower for w in spam_keywords)
-        
+        clean_body = re.sub(r'\s+', ' ', raw_input).strip()
+        query_components.append(clean_body[:350])
+
+        return " | ".join(query_components)
+
+    def build_context(self, raw_input: str, metadata: dict = None) -> dict:
+        search_results = self.vector_store.similarity_search_with_score(
+            query=raw_input, 
+            k=5
+        )
+
+        retrieved_matches = []
+        max_risk_score = 0.0
+        high_risk_hits = 0
+        top_threat_source = "Known Threat Intelligence" 
+
+        for doc, score in search_results:
+            doc_meta = doc.metadata or {}
+            content = doc.page_content
+            
+            # Extract Risk Score and dynamic source
+            distance = float(score)
+            calculated_risk = max(0.0, min(1.0, 1.0 - distance))
+            risk = float(doc_meta.get("risk_score", round(calculated_risk, 2)))
+            current_source = doc_meta.get("source", "Known Threat Intelligence")
+
+            if risk > max_risk_score:
+                max_risk_score = risk
+                top_threat_source = current_source
+                
+            if risk >= 0.70:
+                high_risk_hits += 1
+
+            # Derive SOP / Category fallback
+            sop_id = doc_meta.get("sop_id")
+            category = doc_meta.get("category")
+            indicator_type = doc_meta.get("indicator_type")
+
+            if not sop_id:
+                if "login" in content.lower() or "http" in content.lower():
+                    sop_id = "SOP-103"
+                    category = "phishing_link"
+                    indicator_type = "url_pattern"
+                elif "practicum" in content.lower() or "consulting" in content.lower():
+                    sop_id = "SOP-104"
+                    category = "recruitment_fraud"
+                    indicator_type = "social_engineering"
+                else:
+                    sop_id = "SOP-101"
+                    category = "benign_notification"
+                    indicator_type = "platform_alert"
+
+            preview_content = content.replace("\n", " ")
+            if len(preview_content) > 120:
+                preview_content = preview_content[:117] + "..."
+
+            retrieved_matches.append({
+                "Indicator Signature": preview_content,
+                "Type": indicator_type,
+                "Risk Score": risk,
+                "Mapped SOP": sop_id,
+                "Category": category,
+                "Source": current_source,
+                "Vector Distance": round(distance, 4)
+            })
+
         return {
-            "text_length": len(raw_str),
-            "has_urls": has_urls,
-            "urgency_language": has_urgency
+            "raw_input": raw_input,
+            "retrieved_matches": retrieved_matches,
+            "max_risk_score": max_risk_score,
+            "high_risk_hits": high_risk_hits,
+            "threat_source": top_threat_source,
+            "retrieval_confidence": max([max(0.0, 1.0 - m["Vector Distance"]) for m in retrieved_matches], default=0.0),
+            "retrieved_policies": DEFAULT_POLICIES
         }
-
-    def build_context(self, raw_input: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Queries local ChromaDB vector store for relevant policies."""
-        try:
-            docs = self.vector_store.similarity_search(str(raw_input), k=2)
-            retrieved_policies = [doc.page_content for doc in docs]
-            if not retrieved_policies:
-                retrieved_policies = ["SOP-100: Block unsolicited spam, promotions, phishing, and scam emails. Allow legitimate business email."]
-        except Exception:
-            retrieved_policies = ["SOP-100: Block unsolicited spam, promotions, phishing, and scam emails. Allow legitimate business email."]
-
-        metadata = metadata or {}
-        features = self.extract_features(raw_input)
-
-        return {
-            "retrieved_policies": retrieved_policies,
-            "raw_input": str(raw_input),
-            "text_length": features["text_length"],
-            "has_urls": features["has_urls"],
-            "urgency_language": features["urgency_language"],
-            "metadata": metadata
-        }
-
+    
     def get_prompt_template(self):
         def prompt(signal: ThreatSignal, adapter: DomainAdapter) -> str:
-            policies = "\n".join(
-                f"  - {p}"
-                for p in signal.context.get('retrieved_policies', [])
-            )
-            email_text = signal.context.get('raw_input', '[No email text available]')
-            risk = getattr(signal, "risk_score", 0.0)
-            has_urls = signal.context.get("has_urls", False)
-            spam_words = signal.context.get("urgency_language", False)
+            ctx = signal.context or {}
+            email_text = ctx.get("raw_input", signal.raw_payload or "")
+            pred_class = ctx.get("ml_predicted_class", "UNKNOWN")
+            confidence = getattr(signal, "risk_score", 0.50)
 
-            return f"""SYSTEM: You are an automated security daemon. You must output ONLY raw JSON. Do not write any conversational text, introductions, or conclusions outside the JSON.
+            return f"""You are a senior enterprise security analyst categorizing an incoming email into one of three classes: PHISHING, SPAM, or VALID.
 
-SECURITY POLICIES:
-{policies}
+TELEMETRY:
+- Local ML Prediction: {pred_class} (Confidence: {confidence:.4f})
 
-METRICS:
-- Risk Score: {risk}/1.0
-- External Links: {has_urls}
-- Suspicious Keywords: {spam_words}
+OPERATIONAL RULES:
+1. PHISHING: Credential harvesting, malicious links, fraud, or manipulative urgency (e.g., "urgent account update").
+2. SPAM: Unsolicited marketing, bulk newsletters, or low-value promotions without malicious intent.
+3. VALID: Legitimate business correspondence or expected automated alerts.
 
-EMAIL CONTENT:
+---
+EXAMPLE (PHISHING):
+Email: "URGENT: Your IT mailbox is full. Click here to verify your credentials."
+Output:
+{{
+  "action": "PHISHING",
+  "confidence": 0.95,
+  "reasoning": "Manipulative urgency requesting credential verification via an external link."
+}}
+
+EXAMPLE (SPAM):
+Email: "Act now to get 50% off our new enterprise SEO tool! Unsubscribe here."
+Output:
+{{
+  "action": "SPAM",
+  "confidence": 0.90,
+  "reasoning": "Unsolicited promotional bulk email, no immediate security threat."
+}}
+---
+
+EVALUATE THE FOLLOWING EMAIL:
+
+Email Text:
 \"\"\"
 {email_text}
 \"\"\"
 
-CLASSIFICATION RULES:
-1. Output "BLOCK" if the email appears to be unsolicited marketing, promotional offers, financial scams, external phishing, or generic mass emails.
-2. Output "ALLOW" ONLY if the email is legitimate internal company business, trade correspondence, scheduling, personal workplace emails, or technical reports.
-3. If suspicious indicators (urgency language, external links, promotional phrasing) are present and the email lacks internal corporate context, default to "BLOCK".
-
-YOU MUST RESPOND WITH ONLY THIS EXACT JSON FORMAT AND NOTHING ELSE:
-{{
-  "action": "BLOCK" or "ALLOW",
-  "reasoning": "Brief 1-sentence explanation"
-}}
+Respond strictly with a raw JSON object containing "action", "confidence", and "reasoning".
 """
         return prompt

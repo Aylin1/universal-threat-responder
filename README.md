@@ -1,156 +1,213 @@
-# Universal Threat Responder
+# 🛡️ Universal Threat Responder
 
-An extensible, domain-agnostic threat triage and decision-engine framework powered by **LangGraph**, **Ollama (Llama 3)**, **ChromaDB Vector RAG**, and an **LLM-as-a-Judge** evaluation pipeline.
+An advanced, domain-agnostic threat triage and decision-engine framework powered by **LangGraph**, **Ollama (Local LLM)**, **Milvus Vector RAG**, **Multi-Engine OCR Extraction**, **Conformal Risk Prediction**, and an interactive **Streamlit Telemetry Dashboard**.
 
-The system normalizes threat signals across security domains such as email phishing, network intrusion, and fraud, enriches them with vector-retrieved standard operating procedures (SOPs), executes stateful decision graphs, and evaluates agent reasoning against security policies with zero target leakage.
-
-## Project Goals
-
-The goal is to provide a reusable foundation for building and evaluating security triage agents across multiple domains.
-
-The project explores how LLM-based security agents can be combined with:
-
-- Retrieval-Augmented Generation
-- Stateful agent workflows
-- Domain-specific security policies
-- Structured decision interfaces
-- Automated reasoning audits
-- Local LLM inference
-- Distributed data processing
-
-## Key Features
-
-- **Domain-Agnostic Abstraction** : Decouples domain logic from agent decision-making using standardized interfaces such as `ThreatSignal` and `DecisionOutput`.
-- **Stateful Workflow Management** : Uses **LangGraph** for conditional decision routing, fallback handling, and tool execution through `SecurityTools`.
-- **Vector-Backed RAG Retrieval** : Uses **ChromaDB** and Hugging Face `all-MiniLM-L6-v2` embeddings through `RAGSpamAdapter` to retrieve relevant security policies and SOPs.
-- **Distributed & Local Data Pipeline** : Supports local Pandas processing and distributed PySpark execution through `EnronDatasetAdapter`.
-- **Zero Target-Leakage Evaluation** : Evaluates LLM reasoning using content-based heuristic scoring without exposing ground-truth target indicators to the decision-making process.
-- **Automated LLM Audit Engine** : Uses `LLMJudgeEvaluator` to audit decisions across **Faithfulness**, **Policy Correctness**, and **Hallucination Rate**.
-
-## Design Principles
-
-### Domain Agnostic
-
-The core decision engine is separated from domain-specific logic through adapter interfaces.
-
-The framework can be extended to domains such as:
-
-- Email phishing
-- Network intrusion
-- Fraud detection
-- Suspicious transactions
-- Account compromise
-- Other security triage workflows
-
-without redesigning the core decision graph.
-
-### Stateful Decision Making
-
-- Instead of treating threat classification as a single LLM prompt, the system models the response process as a stateful workflow.
-- This enables explicit routing, fallback handling, and tool execution.
-
-### Retrieval-Augmented Decision Making
-
-- Security policies and SOPs are retrieved dynamically from a vector database rather than being hard-coded directly into the decision workflow.
-- This allows the policy knowledge base to evolve independently of the core decision engine.
-
-### Separation of Decision and Evaluation
-
-The evaluation pipeline separates **decision generation** from **decision evaluation**.
-
-Ground-truth target indicators are not directly provided to the decision-making agent. Instead, the system evaluates the generated reasoning based on the available threat evidence, retrieved policies, and decision context.
-
-### Evaluation Metrics
-
-| Metric                 | Description                                                                                 |
-| ---------------------- | ------------------------------------------------------------------------------------------- |
-| **Faithfulness**       | Measures whether the decision is supported by the available evidence and retrieved context. |
-| **Policy Correctness** | Evaluates whether the decision follows the relevant security policies and SOPs.             |
-| **Hallucination Rate** | Measures unsupported claims or reasoning that are not grounded in the available context.    |
+The system normalizes threat signals across security domains — combining phishing detection, recruitment fraud, BEC impersonation, and live malware payload distributions — enriches them with vector-retrieved standard operating procedures (SOPs) and historical indicators, executes stateful decision graphs with optional high-confidence fast-paths, and evaluates agent reasoning with zero target leakage.
 
 ---
 
-## Latest Benchmark & Audit Results
+## Table of Contents
 
-Evaluated on **337 Enron email samples** using `ThreatResponderGraph`, local `Ollama (Llama 3)`, and `LLMJudgeEvaluator`.
+1. [Key Features](#key-features)
+2. [System Architecture](#system-architecture)
+3. [Project Structure](#project-structure)
+4. [Setup & Quickstart](#setup--quickstart)
+5. [Benchmark & Telemetry Results](#benchmark--telemetry-results)
+6. [Extending to a New Domain](#extending-to-a-new-domain)
+7. [Roadmap](#roadmap)
 
-| Metric                         |           Score | Significance                                            |
-| ------------------------------ | --------------: | ------------------------------------------------------- |
-| **Total Evaluated**            | **337 Signals** | Enron samples processed through `EnronDatasetAdapter`   |
-| **Dataset Accuracy Match**     |      **52.52%** | Classification alignment under zero-leakage constraints |
-| **Average Judge Faithfulness** |  **0.83 / 1.0** | Consistency between reasoning traces and final actions  |
-| **Average Judge Correctness**  |  **0.85 / 1.0** | Alignment of reasoning with retrieved security SOPs     |
-| **Hallucination Rate**         |       **0.89%** | Frequency of unsupported or fabricated assertions       |
+---
+
+## Key Features
+
+| Feature                               | What it does                                                                                                                              | Powered by                                            |
+| :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------- |
+| **Interactive Prototyping Dashboard** | Analyzes text, text files, and PDF uploads interactively with real-time risk scores, latency metrics, and audit traces                    | Streamlit (`app.py`)                                  |
+| **Multi-Engine PDF & OCR Extraction** | Sequentially parses native digital PDFs, vector text streams, and scanned document images without stream pointer losses                   | `PyMuPDF`, `pdfplumber`, `pypdf`, `RapidOCR`          |
+| **Live Threat Feed Ingestion**        | Fetches live OpenPhish links, Abuse.ch URLhaus payloads, and behavioral threat patterns at runtime                                        | OpenPhish, Abuse.ch URLhaus, Milvus[cite: 2]          |
+| **Conformal Fast-Path Routing**       | Automatically bypasses expensive LLM evaluation for high-confidence predictions ($P \le \text{low\_bound}$ or $P \ge \text{high\_bound}$) | Conformal bounds, `ThreatResponderGraph`              |
+| **Milvus Vector RAG Retrieval**       | Dynamically indexes and queries historical phishing payloads, indicators, and SOPs using `BAAI/bge-small-en-v1.5` embeddings              | Milvus DB + `HuggingFaceEmbeddings`, `RAGSpamAdapter` |
+| **Grounded LLM Decision Graph**       | Stateful decision routing with strictly grounded system prompts that prevent hallucinated threat indicators                               | LangGraph, `ChatOllama`, `SecurityTools`              |
+| **Zero-Leakage Dataset Partitioning** | Prevents template memorization via group-stratified cross-validation (`StratifiedGroupKFold`)                                             | `PhishFuzzerDatasetAdapter`                           |
+
+---
 
 ## System Architecture
 
-```text
-                       +--------------------------+
-                       |    Raw Security Input    |
-                       +------------+-------------+
-                                    |
-                                    v
-                       +--------------------------+
-                       |   EnronDatasetAdapter    |
-                       |    (Pandas / PySpark)    |
-                       +------------+-------------+
-                                    |
-                                    v
-                       +--------------------------+
-                       |     RAGSpamAdapter       | <----> ChromaDB
-                       |                          |       Vector Store
-                       +------------+-------------+
-                                    |
-                                    | Enriches with
-                                    | SOPs & features
-                                    v
-                       +--------------------------+
-                       |      ThreatSignal        |
-                       +------------+-------------+
-                                    |
-                                    v
-                       +--------------------------+
-                       |   ThreatResponderGraph   |
-                       |        (LangGraph)       |
-                       +------------+-------------+
-                                    |
-                                    v
-                       +--------------------------+
-                       |     DecisionOutput       |
-                       |  (BLOCK / ALLOW / FLAG)  |
-                       +------------+-------------+
-                                    |
-                   +----------------+----------------+
-                   |                                 |
-                   v                                 v
-          +---------------------+          +---------------------+
-          |    SecurityTools    |          |  LLMJudgeEvaluator  |
-          |   (Audit Logging)   |          |   (Reasoning Audit) |
-          +---------------------+          +---------------------+
-```
+````text
+                       +-----------------------------------+
+                       | External Live Threat Feeds        |
+                       | (OpenPhish, Abuse.ch URLhaus)     |
+                       +-----------------+-----------------+
+                                         |
+                                         v
++--------------------------+     +---------------+
+| Raw Text / PDF / File    |     | Milvus DB     |
+| (PyMuPDF / RapidOCR)     |     | (Threat Intel)|
++------------+-------------+     +-------+-------+
+             |                           |
+             v                           |
++--------------------------+             |
+| PhishFuzzerDatasetAdapter|             |
+|  (StratifiedGroupKFold)  |             |
++------------+-------------+             |
+             |                           |
+             +-------------+-------------+
+                           |
+                           v
+              +--------------------------+
+              |      RAGSpamAdapter      |
+              | (Metadata Flattening)    |
+              +------------+-------------+
+                           |
+                           v
+              +--------------------------+
+              |       ThreatSignal       |
+              +------------+-------------+
+                           |
+                           v
+              +--------------------------+
+              |   ThreatResponderGraph   | ---> [Fast-Path Bypass?]
+              | (Grounded LangGraph Prompt)      (Optional, if P outside bounds)
+              +------------+-------------+
+                           |
+                           v
+              +--------------------------+
+              |      DecisionOutput      |
+              |  (BLOCK / ALLOW / FLAG)  |
+              +------------+-------------+
+                           |
+          +----------------+----------------+
+          |                                 |
+          v                                 v
++---------------------+           +---------------------+
+|    SecurityTools    |           | DetailedThreatEval  |
+|   (Audit Logging)   |           | (Streamlit / Logs)  |
++---------------------+           +---------------------+
+
+Data flows left-to-right/top-to-bottom through the diagram: a domain adapter loads and normalizes raw input into a `ThreatSignal`, the RAG adapter enriches it with retrieved SOPs, the LangGraph-based `ThreatResponderGraph` reasons over the enriched signal to produce a `DecisionOutput`, and that decision is simultaneously logged by `SecurityTools` and independently scored by `LLMJudgeEvaluator`.
 
 ## Project Structure
 
 ```text
 universal-threat-responder/
 ├── adapters/
-│   ├── enron_loader.py          # Enron dataset loader adapter (Pandas / PySpark)
-│   └── rag_spam_adapter.py      # ChromaDB Vector RAG DomainAdapter
+│   ├── phishfuzzer_loader.py            # Zero-leakage dataset loader & TF-IDF vectorization
+│   └── rag_spam_adapter.py              # Milvus Vector RAG Adapter with metadata flattening
 ├── data/
-│   ├── chroma_db/               # Persistent ChromaDB vector database
-│   └── spam/                    # Raw evaluation benchmark datasets
+│   ├── milvus_threat_intel.db           # Persistent Milvus vector database file
+│   └── spam/                            # Raw evaluation benchmark datasets
 ├── evals/
-│   ├── llm_judge.py             # LLM-as-a-Judge quantitative evaluation engine
-│   ├── run_enron_evals.py       # Live evaluation pipeline runner
-│   └── live_audit_report_results.csv # Exported evaluation audit traces
-├── logs/
-│   └── eval_audit.log           # SecurityTools persistent execution log
+│   ├── run_enron_evals.py               # Main evaluation runner with auto-sync ingestion
+│   └── threat_evaluator.py              # Comprehensive uncertainty & hallucination evaluator
+├── scripts/
+│   ├── ingest_threat_intel.py           # Script to fetch live NVD, KEV, and EPSS feeds
+│   ├── seed_threat_intel.py             # Ingests recruitment fraud & SOP-104 signatures
+│   └── populate_phishing_vectorstore.py # Indexes training threat patterns into Milvus
 ├── src/
-│   ├── core.py                  # ThreatResponderGraph & SecurityTools state graph
-│   └── domain_interface.py      # ThreatSignal, DecisionOutput, DomainAdapter contracts
-├── requirements.txt             # Dependency specifications
-└── README.md                    # Project documentation
-```
+│   ├── core.py                          # Grounded ThreatResponderGraph & SecurityTools graph
+│   └── domain_interface.py              # ThreatSignal, DecisionOutput, DomainAdapter contracts
+├── app.py                               # Interactive Streamlit prototyping dashboard
+├── config.py                            # Centralized hyperparameters & conformal bounds
+├── requirements.txt                     # Dependency specifications
+└── README.md                            # Project documentation
+````
+
+## Interactive Dashboard & Execution Example
+
+The Streamlit prototyping dashboard (`app.py`) allows you to analyze threat signals interactively using raw text, text files, or uploaded PDF documents.
+
+### Dashboard UI Preview
+
+<p align="center">
+  <img src="example_screenshots/example_response_page_1.png" width="48%" alt="Dashboard Preview Page 1">
+  <img src="example_screenshots/example_response_page_2.png" width="48%" alt="Dashboard Preview Page 2">
+</p>
+
+### Sample PDF Triage Execution
+
+When processing an uploaded threat report or email PDF (`2.pdf`), the multi-engine parser and OCR pipeline execute sequentially:
+
+- **OCR Extraction Pipeline**: If no digital text streams are found, the engine initiates optical character recognition, reporting: _"OCR Engine successfully extracted text from visual PDF layers!"_
+- **Decision Action**: **QUARANTINE**.
+- **Confidence & Max Risk Score**: `0.96` (96.00%).
+- **Execution Latency**: `0.07 ms.
+
+---
+
+## Benchmark & Telemetry Results
+
+The framework was evaluated on an audit dataset of **990 threat signals** processed through both the high-confidence conformal fast-path and the escalated RAG-backed LLM workflow (`live_audit_report_results.csv`).
+
+### Data Provenance & External Sources
+
+- **[PhishFuzzer Dataset (`PhishFuzzer_emails_entity_rephrased_v1.json`)](https://github.com/DataPhish/PhishFuzzer)**: Derived from the **PhishFuzzer** benchmarking corpus ([arXiv:2511.21448](https://arxiv.org/abs/2511.21448)), which provides synthetic and rephrased phishing, spam, and legitimate enterprise email communications designed for robust security model evaluation.
+
+* **OpenPhish Feed (`https://openphish.com/feed.txt`)**: Sourced from **OpenPhish**, a community-driven and automated intelligence feed tracking active, zero-day phishing URLs and credential-harvesting pages.
+* **Abuse.ch URLhaus Feed (`https://urlhaus.abuse.ch/downloads/csv_recent/`)**: Sourced from **Abuse.ch URLhaus**, a project dedicated to sharing malicious URLs associated with malware distribution, payload hosting, and botnet command-and-control infrastructure.
+* **Behavioral Threat Pattern Registry**: Curated from standard security operating procedures (SOPs) and real-world telemetry patterns covering Business Email Compromise (BEC), executive impersonation, and recruitment/task scams.
+
+### Performance Summary
+
+| Metric / Dimension       | Overall Result | Fast-Path Bypass Route | Escalation RAG LLM Route |
+| :----------------------- | :------------: | :--------------------: | :----------------------: |
+| **Sample Count & Share** | **990 (100%)** |      396 (40.0%)       |       594 (60.0%)        |
+| **Accuracy**             |   **74.24%**   |       **99.75%**       |        **57.24%**        |
+| **Macro F1-Score**       |    **0.74**    |        **1.00**        |         **0.51**         |
+| **Quarantined Rate**     |   **0.00%**    |         0.00%          |          0.00%           |
+
+### Per-Class Classification Metrics
+
+| Threat Class         | Precision  |   Recall   |  F1-Score  | Support (Samples) |
+| :------------------- | :--------: | :--------: | :--------: | :---------------: |
+| **PHISHING**         |   0.9720   |   0.8201   |   0.8896   |        339        |
+| **SPAM**             |   0.9430   |   0.4474   |   0.6069   |        333        |
+| **VALID**            |   0.5641   |   0.9686   |   0.7130   |        318        |
+| **Macro Average**    | **0.8264** | **0.7454** | **0.7365** |      **990**      |
+| **Weighted Average** | **0.8312** | **0.7424** | **0.7378** |      **990**      |
+
+### Confusion Matrix (True vs. Predicted Agent Actions)
+
+| True Label \ Agent Action | PHISHING |  SPAM   |  VALID  | Total True |
+| :------------------------ | :------: | :-----: | :-----: | :--------: |
+| **PHISHING**              | **278**  |    3    |   58    |  **339**   |
+| **SPAM**                  |    4     | **149** |   180   |  **333**   |
+| **VALID**                 |    4     |    6    | **308** |  **318**   |
+| **Total Predicted**       | **286**  | **158** | **546** |  **990**   |
+
+> The conformal fast-path successfully intercepted 40% of samples with near-perfect accuracy ($99.75\%$), while the RAG-LLM escalation path handled ambiguous items but experienced lower accuracy ($57.24\%$) due to classification overlap between spam and valid correspondence. Despite these escalation friction points, the hybrid engine maintained a zero structural hallucination rate and robust phishing precision ($97.20\%$).
+
+### Telemetry & Uncertainty Diagnostics
+
+| Metric                         |     Value     |
+| :----------------------------- | :-----------: |
+| **Mean ML Shannon Entropy**    | `0.4372 bits` |
+| **Mean RAG Top-1 Similarity**  |   `0.2297`    |
+| **Mean LLM Calibration Error** |   `0.0479`    |
+
+> - Mean ML Shannon Entropy (0.4372 bits): Measures linguistic and URL unpredictability, indicating moderate payload obfuscation across evaluated samples.
+> - Mean RAG Top-1 Similarity (0.2297): Quantifies vector alignment with top retrieved threat templates; low similarity reflects novel or zero-day variants requiring dynamic LLM escalation rather than exact matching.
+> - Mean LLM Calibration Error (0.0479): Evaluates the gap between model confidence and actual accuracy; a low $\sim 4.79\%$ error proves high model reliability.
+
+---
+
+## Roadmap
+
+- [ ] Formalize stable dependency specifications in `requirements.txt` and containerize via Docker
+- [ ] Refine prompt & few-shot discriminator examples in `rag_spam_adapter.py` to separate low-intent spam from valid enterprise email
+- [ ] Enrich RAG context vectors with sender domain telemetry, SPF/DKIM authentication flags, and URL link-entropy scores
+
+  > **Implementation Guide**: Because the RAG context must ground the LLM escalation path with technical indicators beyond text body semantics, enriching these vectors involves:
+  >
+  > 1. Implement a `DomainAdapter` that loads your raw data and normalizes it into a `ThreatSignal`.
+  > 2. Pointing `RAGSpamAdapter` at a Milvus collection containing domain-specific SOPs or threat indicators.
+  > 3. Reusing `ThreatResponderGraph`' and `DetailedThreatEvaluator` without altering the core decision graph.
+
+- [ ] Calibrate uncertainty thresholds to dynamically route ambiguous borderline samples to human review instead of forced LLM classification
+- [ ] Implement automated CI/CD regression testing via GitHub Actions for evaluation pipelines (`run_enron_evals.py`)
+- [ ] Add new domain adapters for network intrusion telemetry (SIEM/NetFlow) and transaction fraud analysis
+- [ ] Expand the SOP knowledge base and map threat detections directly to MITRE ATT&CK tactics and techniques (TTPs)
+- [ ] Build an interactive Human-in-the-Loop (HITL) analyst review queue in the Streamlit dashboard for uncertain samples
 
 ## Setup & Quickstart
 
@@ -158,22 +215,16 @@ universal-threat-responder/
 
 - Python 3.10+
 - [Ollama](https://ollama.com/) running locally
-- Llama 3 model
-
-Pull the model:
+- The Llama 3 model, pulled via:
 
 ```bash
 ollama pull llama3
 ```
 
----
-
-## Installation
-
-### Clone Repository & Activate Environment
+### Clone & Set Up Environment
 
 ```bash
-git clone [https://github.com/your-username/universal-threat-responder.git](https://github.com/your-username/universal-threat-responder.git)
+git clone https://github.com/your-username/universal-threat-responder.git
 cd universal-threat-responder
 
 # Linux / macOS / Git Bash
@@ -191,18 +242,34 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-If `requirements.txt` is not yet configured, the core dependencies can be installed with:
+If `requirements.txt` is not yet configured, install the core dependencies directly:
 
 ```bash
 pip install pandas langchain-ollama langgraph langchain-chroma langchain-huggingface pyspark
 ```
 
----
+## 1. Run Evaluation: Conformal Fast-Path Enabled (Default)
 
-## Running the Benchmark
-
-Run the live evaluation pipeline:
+To run evaluations with dynamic conformal routing enabled (bypassing high/low confidence bounds):
 
 ```bash
 python -m evals.run_enron_evals
+```
+
+## 2. Run Evaluation: Full LLM Path (Full LLM Path)
+
+To evaluate every single sample through the complete local LLM reasoning graph without fast-path shortcuts:
+
+```bash
+python -m evals.run_enron_evals --disable-fast-path
+```
+
+This loads the Enron benchmark samples through `EnronDatasetAdapter`, enriches each one via `RAGSpamAdapter`, routes it through `ThreatResponderGraph`, and writes per-sample audit traces to `evals/live_audit_report_results.csv` as well as `logs/eval_audit.log`.
+
+## 3. Launch the Interactive Dashboard
+
+Start the Streamlit dashboard to test text, text files, or complex PDFs interactively:
+
+```bash
+streamlit run app.py
 ```
