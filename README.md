@@ -25,7 +25,7 @@ The system normalizes threat signals across security domains — combining phish
 | **Interactive Prototyping Dashboard** | Analyzes text, text files, and PDF uploads interactively with real-time risk scores, latency metrics, and audit traces                    | Streamlit (`app.py`)                                  |
 | **Multi-Engine PDF & OCR Extraction** | Sequentially parses native digital PDFs, vector text streams, and scanned document images without stream pointer losses                   | `PyMuPDF`, `pdfplumber`, `pypdf`, `RapidOCR`          |
 | **Live Threat Feed Ingestion**        | Fetches live OpenPhish links, Abuse.ch URLhaus payloads, and behavioral threat patterns at runtime                                        | OpenPhish, Abuse.ch URLhaus, Milvus[cite: 2]          |
-| **Conformal Fast-Path Routing**       | Automatically bypasses expensive LLM evaluation for high-confidence predictions ($P \le \text{low\_bound}$ or $P \ge \text{high\_bound}$) | Conformal bounds, `ThreatResponderGraph`              |
+| **Conformal Fast-Path Routing**       | Automatically bypasses expensive LLM evaluation for high-confidence predictions ($P \le \text{low\_bound}$ or $P \ge \text{high\_bound}$) |
 | **Milvus Vector RAG Retrieval**       | Dynamically indexes and queries historical phishing payloads, indicators, and SOPs using `BAAI/bge-small-en-v1.5` embeddings              | Milvus DB + `HuggingFaceEmbeddings`, `RAGSpamAdapter` |
 | **Grounded LLM Decision Graph**       | Stateful decision routing with strictly grounded system prompts that prevent hallucinated threat indicators                               | LangGraph, `ChatOllama`, `SecurityTools`              |
 | **Zero-Leakage Dataset Partitioning** | Prevents template memorization via group-stratified cross-validation (`StratifiedGroupKFold`)                                             | `PhishFuzzerDatasetAdapter`                           |
@@ -34,7 +34,7 @@ The system normalizes threat signals across security domains — combining phish
 
 ## System Architecture
 
-````text
+```text
                        +-----------------------------------+
                        | External Live Threat Feeds        |
                        | (OpenPhish, Abuse.ch URLhaus)     |
@@ -86,6 +86,7 @@ The system normalizes threat signals across security domains — combining phish
 +---------------------+           +---------------------+
 
 Data flows left-to-right/top-to-bottom through the diagram: a domain adapter loads and normalizes raw input into a `ThreatSignal`, the RAG adapter enriches it with retrieved SOPs, the LangGraph-based `ThreatResponderGraph` reasons over the enriched signal to produce a `DecisionOutput`, and that decision is simultaneously logged by `SecurityTools` and independently scored by `LLMJudgeEvaluator`.
+```
 
 ## Project Structure
 
@@ -111,7 +112,7 @@ universal-threat-responder/
 ├── config.py                            # Centralized hyperparameters & conformal bounds
 ├── requirements.txt                     # Dependency specifications
 └── README.md                            # Project documentation
-````
+```
 
 ## Interactive Dashboard & Execution Example
 
