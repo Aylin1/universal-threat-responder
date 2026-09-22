@@ -25,6 +25,7 @@ def sync_threat_feeds():
 def run_evaluation():
     parser = argparse.ArgumentParser(description="Run Threat Responder Evaluation")
     parser.add_argument("--disable-fast-path", action="store_true", help="Disable ML fast-path bypass")
+    parser.add_argument("--enable-fast-path", action="store_true", help="Enable ML fast-path bypass")
     parser.add_argument("--high-bound", type=float, help="Upper probability bound for auto-block")
     parser.add_argument("--low-bound", type=float, help="Lower probability bound for auto-allow")
     parser.add_argument("--sample-fraction", type=float, help="Fraction of dataset to test")
@@ -43,6 +44,8 @@ def run_evaluation():
 
     if args.disable_fast_path:
         cfg.conformal.use_fast_path = False
+    if args.enable_fast_path:
+        cfg.conformal.use_fast_path = True
     if args.high_bound is not None:
         cfg.conformal.high_bound = args.high_bound
     if args.low_bound is not None:

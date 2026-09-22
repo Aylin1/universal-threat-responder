@@ -26,6 +26,11 @@ class FastPathConformalConfig:
 
 
 @dataclass
+class ThreatRiskConfig:
+    high_risk_threshold: float = 0.95
+
+
+@dataclass
 class LLMConfig:
     provider: str = "ollama"
     model_name: str = "llama3"   # Aligned with 'ollama pull llama3'
@@ -54,6 +59,7 @@ class AppConfig:
     vector_store: VectorStoreConfig = field(default_factory=VectorStoreConfig)
     feeds: ThreatFeedsConfig = field(default_factory=ThreatFeedsConfig)
     conformal: FastPathConformalConfig = field(default_factory=FastPathConformalConfig)
+    risk: ThreatRiskConfig = field(default_factory=ThreatRiskConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)

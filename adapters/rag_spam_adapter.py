@@ -6,6 +6,7 @@ from langchain_milvus import Milvus
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.domain_interface import DomainAdapter, ThreatSignal
+from config import cfg
 
 MIN_RELEVANT_SIMILARITY = 0.10
 
@@ -80,6 +81,7 @@ class RAGSpamAdapter(DomainAdapter):
 
         retrieved_matches = []
         max_risk_score = 0.0
+        max_risk_sop = ""
         high_risk_hits = 0
         top_threat_source = "Known Threat Intelligence" 
 
@@ -90,14 +92,16 @@ class RAGSpamAdapter(DomainAdapter):
             # Extract Risk Score and dynamic source
             distance = float(score)
             calculated_risk = max(0.0, min(1.0, 1.0 - distance))
+
+            # --- FILTER OUT IRRELEVANT MATCHES ---
+            if calculated_risk < MIN_RELEVANT_SIMILARITY:
+                continue
+            # -------------------------------------
+            
             risk = float(doc_meta.get("risk_score", round(calculated_risk, 2)))
             current_source = doc_meta.get("source", "Known Threat Intelligence")
-
-            if risk > max_risk_score:
-                max_risk_score = risk
-                top_threat_source = current_source
-                
-            if risk >= 0.70:
+            
+            if risk >= cfg.risk.high_risk_threshold:
                 high_risk_hits += 1
 
             # Derive SOP / Category fallback
@@ -119,6 +123,11 @@ class RAGSpamAdapter(DomainAdapter):
                     category = "benign_notification"
                     indicator_type = "platform_alert"
 
+            if risk > max_risk_score:
+                max_risk_score = risk
+                max_risk_sop = sop_id
+                top_threat_source = current_source
+
             preview_content = content.replace("\n", " ")
             if len(preview_content) > 120:
                 preview_content = preview_content[:117] + "..."
@@ -137,6 +146,7 @@ class RAGSpamAdapter(DomainAdapter):
             "raw_input": raw_input,
             "retrieved_matches": retrieved_matches,
             "max_risk_score": max_risk_score,
+            "max_risk_sop": max_risk_sop,
             "high_risk_hits": high_risk_hits,
             "threat_source": top_threat_source,
             "retrieval_confidence": max([max(0.0, 1.0 - m["Vector Distance"]) for m in retrieved_matches], default=0.0),
@@ -149,6 +159,8 @@ class RAGSpamAdapter(DomainAdapter):
             email_text = ctx.get("raw_input", signal.raw_payload or "")
             pred_class = ctx.get("ml_predicted_class", "UNKNOWN")
             confidence = getattr(signal, "risk_score", 0.50)
+            max_risk_score = float(ctx.get("max_risk_score", 0.0))
+            max_risk_sop = ctx.get("max_risk_sop", "UNKNOWN")
 
             return f"""You are a senior enterprise security analyst categorizing an incoming email into one of three classes: PHISHING, SPAM, or VALID.
 
