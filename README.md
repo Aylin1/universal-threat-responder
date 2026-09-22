@@ -226,20 +226,20 @@ Threat intelligence was synchronized before evaluation, including **30 OpenPhish
 | :----------------------------- | :---------------: | :----------------: |
 | **Samples**                    |     **3,960**     |     **3,960**      |
 | **Fast-Path Bypass**           |    **41.44%**     |     **0.00%**      |
-| **Accuracy**                   |    **74.67%**     |     **66.24%**     |
-| **Macro Precision**            |    **82.63%**     |     **78.69%**     |
-| **Macro Recall**               |    **74.37%**     |     **65.84%**     |
-| **Macro F1**                   |     **0.736**     |     **0.631**      |
-| **Quarantined Rate**           |       0.00%       |       0.00%        |
+| **Accuracy**                   |    **86.44%**     |     **82.37%**     |
+| **Macro Precision**            |    **85.90%**     |     **81.29%**     |
+| **Macro Recall**               |    **85.73%**     |     **79.69%**     |
+| **Macro F1**                   |     **0.845**     |     **0.778**      |
+| **Quarantined Rate**           |    **34.62%**     |     **46.44%**     |
 | **Mean ML Entropy**            |    0.4310 bits    |    0.4310 bits     |
-| **Mean RAG Top-1 Similarity**  |      0.2259       |       0.2279       |
-| **Mean LLM Calibration Error** |      0.0448       |       0.0474       |
+| **Mean RAG Top-1 Similarity**  |      0.2164       |       0.2228       |
+| **Mean LLM Calibration Error** |      0.0449       |       0.0476       |
 
 ### Live Telemetry
 
 | Metric                              |  Latest Value  |
 | :---------------------------------- | :------------: |
-| **High-Risk Threat Indicator Hits** |   **19,332**   |
+| **High-Risk Threat Indicator Hits** |   **13,448**   |
 | **OpenPhish Records**               |     **30**     |
 | **URLhaus Records**                 |     **30**     |
 | **Email Threat Records**            |     **65**     |

@@ -222,8 +222,10 @@ class ThreatResponderGraph:
             return {"action": "PHISHING", "confidence": 0.75, "reasoning": "Parsed via heuristic text fallback."}
         elif "SPAM" in upper_text:
             return {"action": "SPAM", "confidence": 0.75, "reasoning": "Parsed via heuristic text fallback."}
-        elif "VALID" in upper_text or "BENIGN" in upper_text or "SAFE" in upper_text:
-            return {"action": "VALID", "confidence": 0.75, "reasoning": "Parsed via heuristic text fallback."}
+        
+        # Remove or comment out this block:
+        # elif "VALID" in upper_text or "BENIGN" in upper_text or "SAFE" in upper_text:
+        #     return {"action": "VALID", "confidence": 0.75, "reasoning": "Parsed via heuristic text fallback."}
 
         return default_fail
 
@@ -248,6 +250,29 @@ class ThreatResponderGraph:
                 final_action = state["signal"].context.get("ml_predicted_class", "QUARANTINE")
                 reasoning = f"Unresolved output; mapped to ML policy ({final_action})."
 
+            # --- POST-LLM OVERRIDE INJECTION ---
+            high_bound = getattr(cfg.conformal, "high_bound", 0.95)
+            max_risk = sig.context.get("max_risk_score", risk)
+            raw_text_lower = sig.raw_payload.lower()
+
+            # Indicator 1: Active URLs
+            has_external_links = "http://" in raw_text_lower or "https://" in raw_text_lower
+
+            # Indicator 2: SOP-104 Social Engineering Vectors (Linkless Scams)
+            social_eng_keywords = [
+                "practicum", "incubator cohort", "bootcamp", "gift card", 
+                "claim code", "apple gift", "reimburse", "board meeting"
+            ]
+            has_social_eng_triggers = any(kw in raw_text_lower for kw in social_eng_keywords)
+
+            # Post-LLM Override Logic
+            if final_action == "VALID" and max_risk >= high_bound:
+                if has_external_links or has_social_eng_triggers:
+                    final_action = "QUARANTINE"
+                    reasoning = (
+                        f"Post-LLM Override: LLM returned VALID, but high-risk threat signal "
+                        f"({max_risk:.2f}) matched active URL or SOP-104 social engineering indicators."
+                    )
             conf = float(parsed.get("confidence", risk))
 
             wall_latency = (perf_counter() - start_wall) * 1000

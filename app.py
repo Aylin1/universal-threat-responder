@@ -2,7 +2,6 @@ import io
 import json
 import csv
 import hashlib
-import inspect
 import random
 import streamlit as st
 
@@ -30,11 +29,6 @@ st.markdown("Test your threat intelligence and classification engine interactive
 
 @st.cache_resource
 def load_threat_engine():
-    min_samples_for_fast_path = getattr(
-        cfg.conformal,
-        "min_samples_for_fast_path",
-        5,
-    )
     adapter = RAGSpamAdapter(
         milvus_uri=cfg.vector_store.uri,
         collection_name=getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
@@ -45,17 +39,11 @@ def load_threat_engine():
         keep_alive=cfg.llm.keep_alive
     )
     tools = SecurityTools(audit_log_path=cfg.paths.audit_log_path)
-    graph_kwargs = {
-        "llm": llm,
-        "tools": tools,
-        "confidence_threshold": cfg.llm.confidence_threshold,
-        "use_fast_path": cfg.conformal.use_fast_path,
-    }
-    if "min_samples_for_fast_path" in inspect.signature(ThreatResponderGraph).parameters:
-        graph_kwargs["min_samples_for_fast_path"] = min_samples_for_fast_path
-
     graph = ThreatResponderGraph(
-        **graph_kwargs,
+        llm=llm,
+        tools=tools,
+        confidence_threshold=cfg.llm.confidence_threshold,
+        use_fast_path=cfg.conformal.use_fast_path
     )
     return adapter, graph
 
@@ -178,15 +166,14 @@ def parse_csv_samples(raw_bytes: bytes) -> list[dict]:
 
     return samples
 
-with st.spinner("Loading threat detection model and vector store..."):
+with st.spinner("Initializing Milvus vector database and local LLM graph..."):
     adapter, agent = load_threat_engine()
 
-st.sidebar.text(
-    "Fast path disabled."
-    if not cfg.conformal.use_fast_path
-    else "Fast path enabled."
-)
-st.sidebar.text(f"Detection model: {cfg.llm.model_name}")
+# Sidebar Telemetry View
+st.sidebar.header("Engine Telemetry Configuration")
+st.sidebar.text(f"Fast-Path Enabled: {cfg.conformal.use_fast_path}")
+st.sidebar.text(f"Conformal Bounds: [{cfg.conformal.low_bound}, {cfg.conformal.high_bound}]")
+st.sidebar.text(f"Model: {cfg.llm.model_name}")
 
 email_text = ""
 samples = []
@@ -276,12 +263,17 @@ if samples:
 
 submitted = st.button("🚀 Analyze Threat Signal(s)", type="primary")
 
-upload_signature = None
+uploaded_bytes = None
 if uploaded_pdf is not None:
-    upload_signature = hashlib.sha256(uploaded_pdf.getvalue()).hexdigest()
+    uploaded_bytes = uploaded_pdf.getvalue()
 elif uploaded_batch is not None:
-    upload_signature = hashlib.sha256(uploaded_batch.getvalue()).hexdigest()
+    uploaded_bytes = uploaded_batch.getvalue()
 
+upload_signature = (
+    hashlib.sha256(uploaded_bytes).hexdigest()
+    if uploaded_bytes is not None
+    else None
+)
 new_upload = (
     upload_signature is not None
     and upload_signature != st.session_state.get("last_analyzed_upload")
@@ -302,7 +294,6 @@ if analyze_requested:
                         metadata={
                             "source": "streamlit_ui",
                             "sample_id": sample["id"],
-                            "sample_count": len(samples),
                             **sample.get("metadata", {}),
                         },
                     )
@@ -366,6 +357,10 @@ if analyze_requested:
                 st.info(decision.reasoning)
                 st.write(f"**Audit ID:** `{decision.audit_id}`")
                 st.write(f"**High-Risk Matches:** `{context.get('high_risk_hits', 0)}`")
+                st.write(
+                    f"**SOP Associated With Maximum Risk:** "
+                    f"`{context.get('max_risk_sop', 'UNKNOWN')}`"
+                )
 
                 st.write("**Retrieved Threat Intelligence:**")
                 matches = context.get("retrieved_matches", [])
