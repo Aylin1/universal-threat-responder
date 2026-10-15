@@ -1,17 +1,15 @@
 # ML Core & Analytics
 scikit-learn>=1.3.0
-lightgbm>=4.0.0
+xgboost>=1.7.0
 numpy>=1.24.0
 pandas>=2.0.0
 scipy>=1.11.0
-joblib>=1.3.0
 
 # LLM, LangGraph & Vector RAG Engine
-langchain>=0.1.0
 langchain-core>=0.1.0
 langchain-ollama>=0.1.0
 langchain-milvus>=0.1.0
-langchain-huggingface>=0.0.1
+langchain-huggingface[full]>=0.0.1
 langgraph>=0.0.20
 pymilvus>=2.3.0
 
@@ -27,12 +25,5 @@ rapidocr-onnxruntime>=1.3.0
 # Feed Ingestion & Networking
 requests>=2.31.0
 
-# API & Web Services
-fastapi>=0.104.0
-uvicorn>=0.24.0
-python-multipart>=0.0.6
-
-# Monitoring & Testing
-prometheus-client>=0.18.0
+# Testing
 pytest>=7.4.0
-pyyaml>=6.0
