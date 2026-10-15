@@ -72,16 +72,17 @@ class AgentState(TypedDict):
 
 def route_threat_signal(
     state: AgentState,
-    high_accuracy_bound: float = 0.95,
+    high_accuracy_bound: Optional[float] = None,
 ) -> str:
     sig = state["signal"]
     max_prob = getattr(sig, "risk_score", 0.50)
-    # Pull bounds dynamically from config to prevent over-triggering fast-path
-    hb = getattr(cfg.conformal, "high_bound", 0.95)
-    use_fp = getattr(cfg.conformal, "use_fast_path", True)
+    hb = (
+        getattr(cfg.conformal, "high_bound", 0.95)
+        if high_accuracy_bound is None
+        else high_accuracy_bound
+    )
 
-    # Only trigger fast-path if explicitly enabled and outside the ambiguity window
-    if use_fp and max_prob >= hb:
+    if max_prob >= hb:
         return "fast_path_bypass"
     return "escalate_to_llm"
 
@@ -250,29 +251,17 @@ class ThreatResponderGraph:
                 final_action = state["signal"].context.get("ml_predicted_class", "QUARANTINE")
                 reasoning = f"Unresolved output; mapped to ML policy ({final_action})."
 
-            # --- POST-LLM OVERRIDE INJECTION ---
             high_bound = getattr(cfg.conformal, "high_bound", 0.95)
             max_risk = sig.context.get("max_risk_score", risk)
-            raw_text_lower = sig.raw_payload.lower()
-
-            # Indicator 1: Active URLs
-            has_external_links = "http://" in raw_text_lower or "https://" in raw_text_lower
-
-            # Indicator 2: SOP-104 Social Engineering Vectors (Linkless Scams)
-            social_eng_keywords = [
-                "practicum", "incubator cohort", "bootcamp", "gift card", 
-                "claim code", "apple gift", "reimburse", "board meeting"
-            ]
-            has_social_eng_triggers = any(kw in raw_text_lower for kw in social_eng_keywords)
-
-            # Post-LLM Override Logic
+            policy_guard_applied = False
             if final_action == "VALID" and max_risk >= high_bound:
-                if has_external_links or has_social_eng_triggers:
-                    final_action = "QUARANTINE"
-                    reasoning = (
-                        f"Post-LLM Override: LLM returned VALID, but high-risk threat signal "
-                        f"({max_risk:.2f}) matched active URL or SOP-104 social engineering indicators."
-                    )
+                final_action = "QUARANTINE"
+                policy_guard_applied = True
+                reasoning = (
+                    f"Policy guard: LLM returned VALID despite retrieved risk score "
+                    f"({max_risk:.2f}) meeting the high-risk bound ({high_bound:.2f}); "
+                    "quarantined."
+                )
             conf = float(parsed.get("confidence", risk))
 
             wall_latency = (perf_counter() - start_wall) * 1000
@@ -290,6 +279,7 @@ class ThreatResponderGraph:
                     "self_reported_confidence": conf,
                     "risk_score": risk,
                     "max_risk_score": sig.context.get("max_risk_score", 0.0),
+                    "policy_guard_applied": policy_guard_applied,
                     "shannon_entropy_bits": entropy,
                     "cpu_latency_ms": round(cpu_latency, 2),
                     "wall_latency_ms": round(wall_latency, 2),

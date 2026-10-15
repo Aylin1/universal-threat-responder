@@ -201,7 +201,8 @@ def run_evaluation():
         print(f"F1-Score (Macro 3-Class):           {f1:.3f}")
     print("=" * 60)
 
-    output_path = Path("evals") / f"live_audit_report_results_{run_id}.csv"
+    mode = "fastpath-enabled" if cfg.conformal.use_fast_path else "fastpath-disabled"
+    output_path = Path("evals") / f"live_audit_report_results_{mode}_{run_id}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(output_path, index=False)
     print(f"Saved detailed telemetry log to `{output_path}`")

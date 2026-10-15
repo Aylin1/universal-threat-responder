@@ -146,8 +146,8 @@ Evaluation
                     ┌────────────────────┐
                     │   DecisionOutput    │
                     │                    │
-                    │ BLOCK / ALLOW /    │
-                    │ FLAG               │
+                    │ PHISHING / SPAM    │
+                    │ VALID / QUARANTINE │
                     └─────────┬──────────┘
                               │
                     ┌─────────┴─────────┐
@@ -167,22 +167,32 @@ The current implementation normalizes inputs into a `ThreatSignal`, enriches the
 ```text
 universal-threat-responder/
 ├── adapters/
+│   ├── __init__.py
 │   ├── phishfuzzer_loader.py            # Zero-leakage dataset loader & TF-IDF vectorization
 │   └── rag_spam_adapter.py              # Milvus Vector RAG Adapter
 ├── data/
-│   ├── milvus_threat_intel.db           # Persistent Milvus vector database
+│   ├── milvus_threat_intel.db/          # Persistent Milvus Lite vector database
 │   └── spam/                            # Evaluation benchmark datasets
 ├── evals/
+│   ├── __init__.py
 │   ├── run_evals.py                     # Main evaluation runner with threat-intel sync
 │   └── threat_evaluator.py              # Uncertainty & evaluation metrics
 ├── scripts/
+│   ├── update_readme_results.py         # Refreshes README results from latest eval CSVs
 │   ├── ingest_threat_intel.py           # Threat intelligence ingestion
-│   ├── seed_threat_intel.py             # Seeds threat signatures and SOPs
 │   └── populate_phishing_vectorstore.py # Indexes threat patterns into Milvus
 ├── src/
+│   ├── __init__.py
 │   ├── core.py                          # ThreatResponderGraph & SecurityTools
-│   └── domain_interface.py              # ThreatSignal, DecisionOutput, DomainAdapter
-├── app.py                               # Interactive Streamlit dashboard
+│   ├── domain_interface.py              # ThreatSignal, DecisionOutput, DomainAdapter
+│   └── input_parsers.py                  # JSON and CSV batch input parsers
+├── tests/
+│   ├── test_core.py                     # Decision routing, enforcement, and audit behavior
+│   ├── test_evaluator.py                 # Uncertainty and hallucination telemetry
+│   ├── test_high_risk_policy_guard.py    # High-risk VALID override protection
+│   ├── test_input_parsers.py             # JSON and CSV input parsing
+│   └── test_rag_adapter.py               # Retrieval context and entropy calculations
+├── app.py                               # Streamlit dashboard entry point
 ├── config.py                            # Configuration & conformal bounds
 ├── requirements.txt                     # Dependencies
 └── README.md                            # Project documentation
@@ -222,24 +232,29 @@ Threat intelligence was synchronized before evaluation, including **30 OpenPhish
 
 ### Performance Summary
 
-| Metric                         | Fast-Path Enabled | Fast-Path Disabled |
-| :----------------------------- | :---------------: | :----------------: |
-| **Samples**                    |     **3,960**     |     **3,960**      |
-| **Fast-Path Bypass**           |    **41.44%**     |     **0.00%**      |
-| **Accuracy**                   |    **86.44%**     |     **82.37%**     |
-| **Macro Precision**            |    **85.90%**     |     **81.29%**     |
-| **Macro Recall**               |    **85.73%**     |     **79.69%**     |
-| **Macro F1**                   |     **0.845**     |     **0.778**      |
-| **Quarantined Rate**           |    **34.62%**     |     **46.44%**     |
-| **Mean ML Entropy**            |    0.4310 bits    |    0.4310 bits     |
-| **Mean RAG Top-1 Similarity**  |      0.2164       |       0.2228       |
-| **Mean LLM Calibration Error** |      0.0449       |       0.0476       |
+<!-- PERF:START -->
+| Metric | Fast-Path Enabled | Fast-Path Disabled |
+| :--- | :---: | :---: |
+| **Samples** | 3,960 | 3,960 |
+| **Fast-Path Bypass** | 41.44% | 0.00% |
+| **Accuracy** | 88.56% | 81.08% |
+| **Macro Precision** | 87.50% | 79.00% |
+| **Macro Recall** | 87.48% | 78.66% |
+| **Macro F1** | 0.866 | 0.751 |
+| **Quarantined Rate** | 37.10% | 48.21% |
+| **Mean ML Entropy** | 0.4310 bits | 0.4310 bits |
+| **Mean RAG Top-1 Similarity** | 0.2046 | 0.2037 |
+| **Mean LLM Calibration Error** | 0.0449 | 0.0476 |
+
+Latest runs: fast-path enabled = `20261015_144005_794922`, fast-path disabled = `20261015_155558_185194`. Metrics are computed on resolved (non-quarantined) rows. Refresh with `python -m scripts.update_readme_results`.
+
+High-risk threat indicator hits (latest enabled run): **13,260**
+<!-- PERF:END -->
 
 ### Live Telemetry
 
 | Metric                              |  Latest Value  |
 | :---------------------------------- | :------------: |
-| **High-Risk Threat Indicator Hits** |   **13,448**   |
 | **OpenPhish Records**               |     **30**     |
 | **URLhaus Records**                 |     **30**     |
 | **Email Threat Records**            |     **65**     |
@@ -294,12 +309,22 @@ Threat intelligence was synchronized before evaluation, including **30 OpenPhish
 ### Prerequisites
 
 - Python 3.10+
-- [Ollama](https://ollama.com/) running locally
-- Llama 3
+- [Ollama](https://ollama.com/) installed and running locally
+- Llama 3.2
 
 ```bash
 ollama pull llama3.2
 ```
+
+Keep Ollama running while using the evaluator or dashboard. If Ollama is not
+already running as a background service, open a separate terminal and start it:
+
+```bash
+ollama serve
+```
+
+Leave that terminal open. Run the evaluation or dashboard commands below from
+another terminal.
 
 ### Clone & Set Up Environment
 
@@ -322,6 +347,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+### Run Tests
+
+```bash
+python -m pytest
+```
+
 ### 1. Run Evaluation — Fast-Path Enabled
 
 ```bash
@@ -334,12 +365,16 @@ python -m evals.run_evals
 python -m evals.run_evals --disable-fast-path
 ```
 
-Both commands evaluate the PhishFuzzer dataset and write the resulting audit metrics to:
+Both commands evaluate the PhishFuzzer dataset and write a timestamped telemetry report to:
 
 ```text
-evals/live_audit_report_results.csv
-```
+evals/live_audit_report_results_<fastpath-enabled|fastpath-disabled>_<run_id>.csv
+```n
+After running one or both modes, refresh the README Performance Summary from the latest report of each mode:
 
+```bash
+python -m scripts.update_readme_results
+```n
 ### 3. Launch the Interactive Dashboard
 
 ```bash
