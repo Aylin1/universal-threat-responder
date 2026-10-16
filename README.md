@@ -225,7 +225,7 @@ When processing an uploaded threat report or email PDF (`2.pdf`), the multi-engi
 
 ## Benchmark & Telemetry Results
 
-Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 81.08% to 88.56% (macro F1 0.751 → 0.866) and cut the quarantine rate from 48.21% to 37.10%.
+Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 85.83% to 90.02% (macro F1 0.789 → 0.884) and cut the quarantine rate from 45.66% to 33.74%.
 
 See **[benchmark_results.md](benchmark_results.md)** for the full performance summary, confusion matrices, telemetry, and data provenance.
 

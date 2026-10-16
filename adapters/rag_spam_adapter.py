@@ -8,7 +8,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from src.domain_interface import DomainAdapter, ThreatSignal
 from config import cfg
 
-MIN_RELEVANT_SIMILARITY = 0.10
+# Cosine similarity floor; equals the previous `1 - L2` cutoff of 0.10 (cos = 1 - d / 2).
+MIN_RELEVANT_SIMILARITY = 0.55
 
 DEFAULT_POLICIES = [
     "SOP-101: ALLOW legitimate corporate correspondence, benign newsletters, and verifiable automated alerts.",
@@ -20,6 +21,10 @@ DEFAULT_POLICIES = [
 def compute_shannon_entropy(p: float) -> float:
     p = max(1e-6, min(1.0 - 1e-6, float(p)))
     return - (p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p))
+
+def l2_to_cosine_similarity(distance: float) -> float:
+    """Milvus returns squared L2 distance; for unit-norm embeddings cosine = 1 - d / 2."""
+    return max(0.0, min(1.0, 1.0 - float(distance) / 2.0))
 
 class RAGSpamAdapter(DomainAdapter):
     def __init__(
@@ -91,7 +96,7 @@ class RAGSpamAdapter(DomainAdapter):
             
             # Extract Risk Score and dynamic source
             distance = float(score)
-            calculated_risk = max(0.0, min(1.0, 1.0 - distance))
+            calculated_risk = l2_to_cosine_similarity(distance)
 
             # --- FILTER OUT IRRELEVANT MATCHES ---
             if calculated_risk < MIN_RELEVANT_SIMILARITY:
@@ -149,23 +154,42 @@ class RAGSpamAdapter(DomainAdapter):
             "max_risk_sop": max_risk_sop,
             "high_risk_hits": high_risk_hits,
             "threat_source": top_threat_source,
-            "retrieval_confidence": max([max(0.0, 1.0 - m["Vector Distance"]) for m in retrieved_matches], default=0.0),
+            "retrieval_confidence": max([l2_to_cosine_similarity(m["Vector Distance"]) for m in retrieved_matches], default=0.0),
             "retrieved_policies": DEFAULT_POLICIES
         }
     
+    @staticmethod
+    def _format_retrieved_context(ctx: dict, limit: int = 3) -> str:
+        matches = sorted(
+            ctx.get("retrieved_matches", []), key=lambda m: m.get("Vector Distance", 9.0)
+        )[:limit]
+        if not matches:
+            return "No relevant threat intelligence was retrieved."
+        lines = [
+            f"- [{m['Source']}] {m['Mapped SOP']} ({m['Category']}), risk {m['Risk Score']:.2f}: {m['Indicator Signature']}"
+            for m in matches
+        ]
+        return "\n".join(lines)
+
     def get_prompt_template(self):
         def prompt(signal: ThreatSignal, adapter: DomainAdapter) -> str:
             ctx = signal.context or {}
             email_text = ctx.get("raw_input", signal.raw_payload or "")
             pred_class = ctx.get("ml_predicted_class", "UNKNOWN")
             confidence = getattr(signal, "risk_score", 0.50)
-            max_risk_score = float(ctx.get("max_risk_score", 0.0))
-            max_risk_sop = ctx.get("max_risk_sop", "UNKNOWN")
+            retrieved = self._format_retrieved_context(ctx)
+            policies = "\n".join(ctx.get("retrieved_policies", DEFAULT_POLICIES))
 
             return f"""You are a senior enterprise security analyst categorizing an incoming email into one of three classes: PHISHING, SPAM, or VALID.
 
 TELEMETRY:
 - Local ML Prediction: {pred_class} (Confidence: {confidence:.4f})
+
+RETRIEVED THREAT INTELLIGENCE (reference only; it may be unrelated to this email, so rely on it only if it clearly matches):
+{retrieved}
+
+POLICIES:
+{policies}
 
 OPERATIONAL RULES:
 1. PHISHING: Credential harvesting, malicious links, fraud, or manipulative urgency (e.g., "urgent account update").
