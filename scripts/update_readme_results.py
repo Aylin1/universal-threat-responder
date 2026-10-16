@@ -1,4 +1,4 @@
-"""Refresh the README performance tables from the latest eval report CSVs.
+"""Refresh the benchmark_results.md performance tables from the latest eval report CSVs.
 
 Usage: python -m scripts.update_readme_results
 """
@@ -10,7 +10,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 ROOT = Path(__file__).resolve().parent.parent
-README = ROOT / "README.md"
+RESULTS_DOC = ROOT / "benchmark_results.md"
 REPORT_GLOB = "live_audit_report_results_*.csv"
 START, END = "<!-- PERF:START -->", "<!-- PERF:END -->"
 
@@ -92,18 +92,18 @@ def main() -> int:
     if not reports:
         print("No eval reports found in evals/. Run `python -m evals.run_evals` first.")
         return 1
-    text = README.read_text(encoding="utf-8")
+    text = RESULTS_DOC.read_text(encoding="utf-8")
     if START not in text or END not in text:
-        print(f"README is missing the {START} / {END} markers.")
+        print(f"{RESULTS_DOC.name} is missing the {START} / {END} markers.")
         return 1
     block = f"{START}\n{render(reports)}\n{END}"
     text = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _: block, text, flags=re.S)
     if "disabled" not in reports:
         print("Warning: no fast-path-disabled report found; column left as n/a.")
-    README.write_text(text, encoding="utf-8", newline="\n")
+    RESULTS_DOC.write_text(text, encoding="utf-8", newline="\n")
     for mode, (path, _) in reports.items():
         print(f"{mode}: {path.name}")
-    print("README.md updated.")
+    print(f"{RESULTS_DOC.name} updated.")
     return 0
 
 

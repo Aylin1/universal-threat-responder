@@ -178,7 +178,7 @@ universal-threat-responder/
 │   ├── run_evals.py                     # Main evaluation runner with threat-intel sync
 │   └── threat_evaluator.py              # Uncertainty & evaluation metrics
 ├── scripts/
-│   ├── update_readme_results.py         # Refreshes README results from latest eval CSVs
+│   ├── update_readme_results.py         # Refreshes benchmark_results.md from latest eval CSVs
 │   ├── ingest_threat_intel.py           # Threat intelligence ingestion
 │   └── populate_phishing_vectorstore.py # Indexes threat patterns into Milvus
 ├── src/
@@ -193,6 +193,7 @@ universal-threat-responder/
 │   ├── test_input_parsers.py             # JSON and CSV input parsing
 │   └── test_rag_adapter.py               # Retrieval context and entropy calculations
 ├── app.py                               # Streamlit dashboard entry point
+├── benchmark_results.md                 # Benchmark & telemetry results
 ├── config.py                            # Configuration & conformal bounds
 ├── requirements.txt                     # Dependencies
 └── README.md                            # Project documentation
@@ -224,50 +225,9 @@ When processing an uploaded threat report or email PDF (`2.pdf`), the multi-engi
 
 ## Benchmark & Telemetry Results
 
-The latest evaluation was run on **3,960 samples** from:
+Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 81.08% to 88.56% (macro F1 0.751 → 0.866) and cut the quarantine rate from 48.21% to 37.10%.
 
-`data/spam/PhishFuzzer_emails_entity_rephrased_v1.json`
-
-Threat intelligence was synchronized before evaluation, including **30 OpenPhish records**, **30 Abuse.ch URLhaus records**, and **65 email threat records**.
-
-### Performance Summary
-
-<!-- PERF:START -->
-| Metric | Fast-Path Enabled | Fast-Path Disabled |
-| :--- | :---: | :---: |
-| **Samples** | 3,960 | 3,960 |
-| **Fast-Path Bypass** | 41.44% | 0.00% |
-| **Accuracy** | 88.56% | 81.08% |
-| **Macro Precision** | 87.50% | 79.00% |
-| **Macro Recall** | 87.48% | 78.66% |
-| **Macro F1** | 0.866 | 0.751 |
-| **Quarantined Rate** | 37.10% | 48.21% |
-| **Mean ML Entropy** | 0.4310 bits | 0.4310 bits |
-| **Mean RAG Top-1 Similarity** | 0.2046 | 0.2037 |
-| **Mean LLM Calibration Error** | 0.0449 | 0.0476 |
-
-Latest runs: fast-path enabled = `20261015_144005_794922`, fast-path disabled = `20261015_155558_185194`. Metrics are computed on resolved (non-quarantined) rows. Refresh with `python -m scripts.update_readme_results`.
-
-High-risk threat indicator hits (latest enabled run): **13,260**
-<!-- PERF:END -->
-
-### Live Telemetry
-
-| Metric                              |  Latest Value  |
-| :---------------------------------- | :------------: |
-| **OpenPhish Records**               |     **30**     |
-| **URLhaus Records**                 |     **30**     |
-| **Email Threat Records**            |     **65**     |
-| **Conformal Bounds**                | `[0.05, 0.95]` |
-
-> The fast-path and full-path results use the same 3,960-sample dataset. This is an observational configuration comparison rather than a controlled causal experiment, since enabling fast-path routing changes which samples reach the LLM/RAG pipeline.
-
-### Data Provenance
-
-- **[PhishFuzzer Dataset](https://github.com/DataPhish/PhishFuzzer)** — phishing, spam, and legitimate enterprise email samples.
-- **[OpenPhish](https://openphish.com/)** — live phishing intelligence.
-- **[Abuse.ch URLhaus](https://urlhaus.abuse.ch/)** — malicious URL and malware-distribution intelligence.
-- Behavioral threat patterns and SOP-based indicators are also used for retrieval and enrichment.
+See **[benchmark_results.md](benchmark_results.md)** for the full performance summary, confusion matrices, telemetry, and data provenance.
 
 ---
 
@@ -369,12 +329,14 @@ Both commands evaluate the PhishFuzzer dataset and write a timestamped telemetry
 
 ```text
 evals/live_audit_report_results_<fastpath-enabled|fastpath-disabled>_<run_id>.csv
-```n
-After running one or both modes, refresh the README Performance Summary from the latest report of each mode:
+```
+
+After running one or both modes, refresh the Performance Summary in [benchmark_results.md](benchmark_results.md) from the latest report of each mode:
 
 ```bash
 python -m scripts.update_readme_results
-```n
+```
+
 ### 3. Launch the Interactive Dashboard
 
 ```bash
