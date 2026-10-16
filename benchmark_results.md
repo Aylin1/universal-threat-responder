@@ -56,6 +56,22 @@ Fast-path disabled:
 | **SPAM** | 49 | 197 | 201 |
 | **VALID** | 15 | 15 | 543 |
 
+### Why the full path quarantines so often
+
+Almost all full-path quarantines come from the **policy guard** in `src/core.py`, which converts an LLM `VALID` verdict into `QUARANTINE` when the retrieved `max_risk_score` is at least 0.95. In a re-run of 150 randomly chosen quarantined samples, 149 were guard overrides; there were no parse failures or execution errors. About 41% of quarantined samples are genuinely legitimate mail, and 75% of all samples retrieve a match at or above 0.95, so the guard fires on most `VALID` verdicts.
+
+**Experiment: gating the guard on similarity (not adopted).** The guard was changed to veto `VALID` only when a high-risk match also had cosine similarity of at least 0.80 to the email (full-path run, same dataset; archived in `evals/experiments/`):
+
+| Metric (full path) | Guard as shipped | Similarity-gated guard |
+| :--- | :---: | :---: |
+| Quarantined Rate | 45.66% | 0.08% |
+| Resolved accuracy | 85.83% | 65.48% |
+| Macro F1 | 0.789 | 0.600 |
+| PHISHING emails labelled VALID | 23 (+218 quarantined) | 246 |
+| SPAM emails labelled VALID | 201 (+843 quarantined) | 1,046 |
+
+The quarantine rate collapsed, but only because the LLM labels most mail `VALID` (2,586 of 3,960) and the gate (mean top-1 similarity is only ~0.59) almost never fires. The guard was acting as a safety net against LLM over-prediction of `VALID`, so the change was reverted. Reducing quarantines safely requires fixing the LLM's `VALID` bias first, for example with spam/valid examples in the prompt, or a guard that also considers the ML prediction.
+
 ## Live Telemetry
 
 | Metric                              |  Latest Value  |
