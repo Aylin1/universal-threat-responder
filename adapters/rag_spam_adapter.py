@@ -40,7 +40,10 @@ class RAGSpamAdapter(DomainAdapter):
             encode_kwargs={"normalize_embeddings": True}
         )
 
-        os.makedirs(os.path.dirname(milvus_uri), exist_ok=True)
+        is_local_file = "://" not in milvus_uri
+        local_dir = os.path.dirname(milvus_uri) if is_local_file else ""
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
         self.vector_store = Milvus(
             embedding_function=self.embeddings,
             collection_name=collection_name,

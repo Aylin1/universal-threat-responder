@@ -106,3 +106,34 @@ def test_unparseable_llm_response_defaults_to_quarantine(tmp_path, response):
     decision = graph.respond(make_signal(0.5), MockAdapter())
 
     assert decision.action == "QUARANTINE"
+
+
+def test_invalid_action_is_not_mapped_to_valid(tmp_path):
+    llm = MagicMock()
+    llm.invoke.return_value.content = '{"action":"INVALID","confidence":0.8}'
+    graph = ThreatResponderGraph(
+        llm=llm,
+        tools=SecurityTools(str(tmp_path / "audit.jsonl")),
+        use_fast_path=False,
+    )
+
+    decision = graph.respond(make_signal(0.5), MockAdapter())
+
+    assert decision.action == "QUARANTINE"
+
+
+def test_non_numeric_confidence_keeps_parsed_action(tmp_path):
+    llm = MagicMock()
+    llm.invoke.return_value.content = (
+        '{"action":"VALID","confidence":"high","reasoning":"Not phishing or spam."}'
+    )
+    graph = ThreatResponderGraph(
+        llm=llm,
+        tools=SecurityTools(str(tmp_path / "audit.jsonl")),
+        use_fast_path=False,
+    )
+
+    decision = graph.respond(make_signal(0.5), MockAdapter())
+
+    assert decision.action == "VALID"
+    assert decision.confidence == 0.5

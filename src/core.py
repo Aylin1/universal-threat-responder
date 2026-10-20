@@ -205,14 +205,19 @@ class ThreatResponderGraph:
                         action = "PHISHING"
                     elif "SPAM" in action:
                         action = "SPAM"
-                    elif "VALID" in action or "ALLOW" in action:
+                    elif "INVALID" not in action and ("VALID" in action or "ALLOW" in action):
                         action = "VALID"
                     else:
                         action = "QUARANTINE"
 
+                try:
+                    confidence = float(parsed.get("confidence", 0.85))
+                except (TypeError, ValueError):
+                    confidence = 0.5
+
                 return {
                     "action": action,
-                    "confidence": float(parsed.get("confidence", 0.85)),
+                    "confidence": confidence,
                     "reasoning": str(parsed.get("reasoning", "Parsed successfully via JSON extractor."))
                 }
             except Exception:
