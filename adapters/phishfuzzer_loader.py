@@ -2,9 +2,10 @@ import os
 import re
 import json
 import random
+import joblib
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from urllib.parse import urlparse
 from scipy.sparse import hstack, csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -94,7 +95,10 @@ def extract_structural_features(df: pd.DataFrame) -> np.ndarray:
     features = []
     ip_url_regex = re.compile(r'https?://(?:\d{1,3}\.){3}\d{1,3}')
     url_finder = re.compile(r'https?://[^\s]+')
-
+    # Match whole extensions only, so ".js" does not fire on ".json" and ".htm" not on ".html".
+    suspicious_ext_regex = re.compile(
+        "(?:" + "|".join(re.escape(e) for e in sorted(SUSPICIOUS_EXTENSIONS, key=len, reverse=True)) + r")(?![a-z0-9])"
+    )
     for _, row in df.iterrows():
         subject = str(row.get('Subject', ''))
         body = str(row.get('Body', ''))
@@ -104,15 +108,11 @@ def extract_structural_features(df: pd.DataFrame) -> np.ndarray:
         
         full_text = f"{subject} {body} {url_str} {file_str}".lower()
 
-        urls_in_text = url_finder.findall(full_text)
-        url_count = len(urls_in_text) + (1 if url_str and url_str != "nan" else 0)
+        urls_in_text = set(url_finder.findall(full_text))
+        url_count = len(urls_in_text) or (1 if url_str and url_str != "nan" else 0)
         has_ip_url = 1.0 if bool(ip_url_regex.search(full_text)) else 0.0
 
-        has_suspicious_ext = 0.0
-        for ext in SUSPICIOUS_EXTENSIONS:
-            if ext in full_text or ext in file_str:
-                has_suspicious_ext = 1.0
-                break
+        has_suspicious_ext = 1.0 if suspicious_ext_regex.search(full_text) else 0.0
 
         sender_domain = sender.split('@')[-1].strip() if '@' in sender else ""
         is_freemail = 1.0 if sender_domain in FREEMAIL_DOMAINS else 0.0
@@ -142,6 +142,94 @@ def extract_structural_features(df: pd.DataFrame) -> np.ndarray:
     return np.array(features, dtype=np.float32)
 
 
+CLASSES = ["VALID", "SPAM", "PHISHING"]
+
+_HEADER_RE = re.compile(r'^(Subject|Sender|From|Links|Attachments):[ \t]*(.*)$', re.IGNORECASE)
+_HEADER_TO_COLUMN = {
+    "subject": "Subject", "sender": "Sender", "from": "Sender", "links": "Url", "attachments": "File",
+}
+
+
+def parse_raw_email(text: str) -> Dict[str, str]:
+    """Split a raw email string into the columns the classifier was trained on.
+
+    Understands the `Subject:/Sender:/Links:/Attachments:/Body:` layout used by the evaluation payloads;
+    anything else is treated as a body-only message.
+    """
+    fields = {"Subject": "", "Sender": "", "Url": "", "File": "", "Body": text}
+    lines = text.splitlines()
+    consumed = 0
+    for line in lines:
+        match = _HEADER_RE.match(line.strip())
+        if not match:
+            break
+        fields[_HEADER_TO_COLUMN[match.group(1).lower()]] = match.group(2).strip()
+        consumed += 1
+    if consumed:
+        body = "\n".join(lines[consumed:]).strip()
+        fields["Body"] = re.sub(r'^Body:[ \t]*', '', body, flags=re.IGNORECASE).strip()
+    return fields
+
+
+def _class_id(label: str) -> int:
+    lbl = str(label).lower()
+    if 'phish' in lbl:
+        return 2
+    if 'spam' in lbl:
+        return 1
+    return 0
+
+
+class EmailThreatClassifier:
+    """TF-IDF + structural features + calibrated tree model; can be saved and reloaded for inference."""
+
+    def __init__(self, vectorizer: TfidfVectorizer, classifier: CalibratedClassifierCV):
+        self.vectorizer = vectorizer
+        self.classifier = classifier
+
+    @classmethod
+    def fit(cls, train_df: pd.DataFrame) -> "EmailThreatClassifier":
+        vectorizer = TfidfVectorizer(
+            max_features=cfg.dataset.tfidf_max_features, stop_words='english', ngram_range=(1, 2)
+        )
+        tfidf = vectorizer.fit_transform(train_df['full_text'])
+        struct = extract_structural_features(train_df)
+        features = hstack([tfidf, csr_matrix(struct)]).tocsr()
+        labels = np.array([_class_id(t) for t in train_df['Type']])
+
+        base_model = XGBClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.05, subsample=0.8,
+            eval_metric='mlogloss', random_state=cfg.dataset.seed
+        ) if HAS_XGBOOST else RandomForestClassifier(n_estimators=100, max_depth=10, random_state=cfg.dataset.seed)
+
+        classifier = CalibratedClassifierCV(estimator=base_model, cv=3, method='sigmoid')
+        classifier.fit(features, labels)
+        return cls(vectorizer, classifier)
+
+    def predict_proba_df(self, df: pd.DataFrame) -> np.ndarray:
+        tfidf = self.vectorizer.transform(df['full_text'])
+        struct = extract_structural_features(df)
+        return self.classifier.predict_proba(hstack([tfidf, csr_matrix(struct)]).tocsr())
+
+    def predict_text(self, raw_text: str) -> Tuple[str, float]:
+        """Return (predicted class, calibrated probability) for one raw email string."""
+        row = parse_raw_email(raw_text)
+        df = pd.DataFrame([row])
+        df['full_text'] = df['Subject'] + "\n" + df['Body']
+        probs = self.predict_proba_df(df)[0]
+        idx = int(np.argmax(probs))
+        return CLASSES[idx], float(probs[idx])
+
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        joblib.dump(self, path)
+
+    @staticmethod
+    def load(path: str) -> "EmailThreatClassifier":
+        # Pickle-based: only load model files produced locally by scripts/train_ml_model.py.
+        return joblib.load(path)
+
+
 class PhishFuzzerDatasetAdapter:
     def __init__(self, file_path: str = None):
         target_path = file_path or cfg.dataset.file_path
@@ -166,28 +254,9 @@ class PhishFuzzerDatasetAdapter:
         self.train_df = self.df.iloc[train_idx].reset_index(drop=True)
         self.test_df = self.df.iloc[test_idx].reset_index(drop=True)
 
-        self.vectorizer = TfidfVectorizer(
-            max_features=cfg.dataset.tfidf_max_features, stop_words='english', ngram_range=(1, 2)
-        )
-        X_train_tfidf = self.vectorizer.fit_transform(self.train_df['full_text'])
-        X_train_struct = extract_structural_features(self.train_df)
-        X_train_combined = hstack([X_train_tfidf, csr_matrix(X_train_struct)]).tocsr()
-
-        def get_class_id(label_str):
-            l = str(label_str).lower()
-            if 'phish' in l: return 2
-            if 'spam' in l: return 1
-            return 0 # valid
-
-        y_train = np.array([get_class_id(t) for t in self.train_df['Type']])
-
-        base_model = XGBClassifier(
-            n_estimators=100, max_depth=4, learning_rate=0.05, subsample=0.8,
-            eval_metric='mlogloss', random_state=cfg.dataset.seed
-        ) if HAS_XGBOOST else RandomForestClassifier(n_estimators=100, max_depth=10, random_state=cfg.dataset.seed)
-
-        self.ml_classifier = CalibratedClassifierCV(estimator=base_model, cv=3, method='sigmoid')
-        self.ml_classifier.fit(X_train_combined, y_train)
+        self.model = EmailThreatClassifier.fit(self.train_df)
+        self.vectorizer = self.model.vectorizer
+        self.ml_classifier = self.model.classifier
 
     def _map_expected_action(self, label: str) -> str:
         lbl = str(label).lower().strip()
@@ -208,8 +277,8 @@ class PhishFuzzerDatasetAdapter:
         X_test_struct = extract_structural_features(sampled_df)
         X_test_combined = hstack([X_test_tfidf, csr_matrix(X_test_struct)]).tocsr()
 
-        classes = ["VALID", "SPAM", "PHISHING"]
-        probabilities = self.ml_classifier.predict_proba(X_test_combined)
+        classes = CLASSES
+        probabilities = self.model.predict_proba_df(sampled_df)
 
         for idx, (_, row) in enumerate(sampled_df.iterrows()):
             expected_action = self._map_expected_action(row['Type'])

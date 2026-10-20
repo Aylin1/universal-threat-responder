@@ -92,13 +92,11 @@ class ThreatResponderGraph:
         self, 
         llm: BaseChatModel, 
         tools: Optional[SecurityTools] = None, 
-        uncertainty_samples: int = 1, 
         confidence_threshold: float = 0.50,
         use_fast_path: bool = True
     ):
         self.llm = llm
         self.tools = tools or SecurityTools()
-        self.uncertainty_samples = max(1, uncertainty_samples)
         self.confidence_threshold = confidence_threshold
         self.use_fast_path = use_fast_path
         self.graph = self._build_graph()
@@ -235,6 +233,26 @@ class ThreatResponderGraph:
 
         return default_fail
 
+    def _high_risk_evidence(self, context: Dict[str, Any]) -> Optional[str]:
+        """Why a retrieved high-risk score should override an LLM `VALID` verdict, or None if it should not.
+
+        Risk scores are fixed per threat-intel record, so a high score alone only shows topical overlap.
+        The veto needs corroboration; contexts that carry no evidence fields fail closed.
+        """
+        evidence_keys = ("ioc_match", "high_risk_similarity", "ml_predicted_class")
+        if not any(key in context for key in evidence_keys):
+            return "no corroboration data available"
+        if context.get("ioc_match"):
+            return "email contains a known threat-intel URL"
+        similarity = float(context.get("high_risk_similarity", 0.0))
+        min_similarity = getattr(cfg.risk, "guard_similarity", 0.80)
+        if similarity >= min_similarity:
+            return f"high-risk match similarity {similarity:.2f}"
+        ml_class = context.get("ml_predicted_class")
+        if ml_class in ("SPAM", "PHISHING"):
+            return f"local ML model predicted {ml_class}"
+        return None
+
     def _node_evaluate_threat(self, state: AgentState) -> Dict[str, Any]:
         start_wall, start_cpu = perf_counter(), process_time()
         sig = state["signal"]
@@ -259,15 +277,28 @@ class ThreatResponderGraph:
             high_bound = getattr(cfg.conformal, "high_bound", 0.95)
             max_risk = sig.context.get("max_risk_score", risk)
             policy_guard_applied = False
+            guard_applied = "none"
             if final_action == "VALID" and max_risk >= high_bound:
-                final_action = "QUARANTINE"
-                policy_guard_applied = True
-                reasoning = (
-                    f"Policy guard: LLM returned VALID despite retrieved risk score "
-                    f"({max_risk:.2f}) meeting the high-risk bound ({high_bound:.2f}); "
-                    "quarantined."
-                )
+                evidence = self._high_risk_evidence(sig.context)
+                if evidence:
+                    final_action = "QUARANTINE"
+                    policy_guard_applied = True
+                    guard_applied = "policy"
+                    reasoning = (
+                        f"Policy guard: LLM returned VALID despite retrieved risk score "
+                        f"({max_risk:.2f}) meeting the high-risk bound ({high_bound:.2f}) "
+                        f"and corroborating evidence ({evidence}); quarantined."
+                    )
             conf = float(parsed.get("confidence", risk))
+            low_confidence_applied = False
+            if final_action != "QUARANTINE" and conf < self.confidence_threshold:
+                final_action = "QUARANTINE"
+                low_confidence_applied = True
+                guard_applied = "low_confidence"
+                reasoning = (
+                    f"Low-confidence guard: LLM confidence ({conf:.2f}) is below the "
+                    f"threshold ({self.confidence_threshold:.2f}); quarantined."
+                )
 
             wall_latency = (perf_counter() - start_wall) * 1000
             cpu_latency = (process_time() - start_cpu) * 1000
@@ -285,6 +316,8 @@ class ThreatResponderGraph:
                     "risk_score": risk,
                     "max_risk_score": sig.context.get("max_risk_score", 0.0),
                     "policy_guard_applied": policy_guard_applied,
+                    "low_confidence_guard_applied": low_confidence_applied,
+                    "guard_applied": guard_applied,
                     "shannon_entropy_bits": entropy,
                     "cpu_latency_ms": round(cpu_latency, 2),
                     "wall_latency_ms": round(wall_latency, 2),

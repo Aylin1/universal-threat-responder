@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from adapters.rag_spam_adapter import RAGSpamAdapter, compute_shannon_entropy, l2_to_cosine_similarity
+from adapters.rag_spam_adapter import (
+    RAGSpamAdapter,
+    compute_shannon_entropy,
+    email_contains_indicator,
+    l2_to_cosine_similarity,
+)
 from config import cfg
 
 
@@ -93,3 +98,59 @@ def test_entropy_is_finite_and_maximal_at_uncertainty():
     assert compute_shannon_entropy(0.5) == 1.0
     assert 0.0 <= compute_shannon_entropy(0.0) < 0.001
     assert 0.0 <= compute_shannon_entropy(1.0) < 0.001
+
+
+def test_build_context_searches_with_condensed_query():
+    queries = []
+    adapter = RAGSpamAdapter.__new__(RAGSpamAdapter)
+    adapter.vector_store = SimpleNamespace(
+        similarity_search_with_score=lambda query, k: queries.append(query) or []
+    )
+
+    adapter.build_context("Subject: Verify now\n\nVisit https://evil.invalid/login today")
+
+    assert queries[0].startswith("Subject: Verify now | https://evil.invalid/login")
+
+
+def test_relevance_cutoff_comes_from_config(monkeypatch):
+    results = [(SimpleNamespace(page_content="Newsletter", metadata={}), 0.5)]  # cosine 0.75
+
+    monkeypatch.setattr(cfg.vector_store, "min_similarity_cutoff", 0.80)
+    assert make_adapter(results).build_context("x")["retrieved_matches"] == []
+
+    monkeypatch.setattr(cfg.vector_store, "min_similarity_cutoff", 0.70)
+    assert len(make_adapter(results).build_context("x")["retrieved_matches"]) == 1
+
+
+IOC_RECORD = "Threat Vector: Active Phishing URL / Link\nTarget URL: http://evil.invalid/login\nSource: OpenPhish Live Feed"
+
+
+def test_email_contains_indicator_matches_normalized_urls():
+    assert email_contains_indicator("Please visit http://evil.invalid/login.", IOC_RECORD)
+    assert email_contains_indicator("Go to https://www.EVIL.invalid/login/ now", IOC_RECORD)
+    assert not email_contains_indicator("Go to http://evil.invalid/other", IOC_RECORD)
+    assert not email_contains_indicator("http://evil.invalid/login", "Subject: no indicator here")
+
+
+def test_build_context_reports_ioc_match_and_high_risk_similarity():
+    adapter = make_adapter([
+        (SimpleNamespace(page_content=IOC_RECORD, metadata={"risk_score": 0.95}), 0.05),
+        (SimpleNamespace(page_content="Newsletter", metadata={"risk_score": 0.40}), 0.30),
+    ])
+
+    context = adapter.build_context("Please visit http://evil.invalid/login")
+
+    assert context["ioc_match"] is True
+    assert context["high_risk_similarity"] == 0.975
+
+
+def test_build_context_without_indicator_has_no_ioc_match():
+    adapter = make_adapter([
+        (SimpleNamespace(page_content=IOC_RECORD, metadata={"risk_score": 0.95}), 0.60),
+    ])
+
+    context = adapter.build_context("Lunch tomorrow? No links here.")
+
+    assert context["ioc_match"] is False
+    assert context["high_risk_similarity"] == 0.70
+

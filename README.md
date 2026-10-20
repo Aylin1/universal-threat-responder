@@ -179,8 +179,9 @@ universal-threat-responder/
 │   └── threat_evaluator.py              # Uncertainty & evaluation metrics
 ├── scripts/
 │   ├── update_readme_results.py         # Refreshes benchmark_results.md from latest eval CSVs
-│   ├── ingest_threat_intel.py           # Threat intelligence ingestion
-│   └── populate_phishing_vectorstore.py # Indexes threat patterns into Milvus
+│   ├── train_ml_model.py                # Trains and saves the ML classifier used by the dashboard (models/)
+│   ├── ingest_threat_intel.py           # Live threat intelligence ingestion (rebuilds `phishing_threat_intel`)
+│   └── populate_phishing_vectorstore.py # Indexes PhishFuzzer training emails into the separate `phishfuzzer_training` collection
 ├── src/
 │   ├── __init__.py
 │   ├── core.py                          # ThreatResponderGraph & SecurityTools
@@ -225,7 +226,7 @@ When processing an uploaded threat report or email PDF (`2.pdf`), the multi-engi
 
 ## Benchmark & Telemetry Results
 
-Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 85.83% to 90.02% (macro F1 0.789 → 0.884) and cut the quarantine rate from 45.66% to 33.74%.
+Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 91.15% to 94.47% (macro F1 0.843 → 0.937) and cut the quarantine rate from 58.91% to 42.95%. Compared with the previous benchmark, accuracy on resolved rows and F1 improved and threats wrongly labelled `VALID` dropped sharply (176 → 25 with fast-path enabled), but the system now abstains more often (quarantine rate 33.74% → 42.95%), so the share of all samples answered correctly fell from 59.65% to 53.89%. Quarantined samples count as abstentions and are excluded from accuracy.
 
 See **[benchmark_results.md](benchmark_results.md)** for the full performance summary, confusion matrices, telemetry, and data provenance.
 
@@ -292,9 +293,13 @@ another terminal.
 git clone https://github.com/Aylin1/universal-threat-responder.git
 cd universal-threat-responder
 
-# Linux / macOS / Git Bash
+# Linux / macOS
 python3 -m venv .venv
 source .venv/bin/activate
+
+# Windows Git Bash
+python -m venv .venv
+source .venv/Scripts/activate
 
 # Windows PowerShell
 python -m venv .venv
@@ -337,11 +342,22 @@ After running one or both modes, refresh the Performance Summary in [benchmark_r
 python -m scripts.update_readme_results
 ```
 
-### 3. Launch the Interactive Dashboard
+### 3. Train the Classifier and Launch the App
+
+The dashboard loads a saved ML classifier from `models/threat_classifier.joblib`. The file is not shipped in the repository (the PhishFuzzer dataset has no published licence, so redistributing a derived model is unconfirmed), so train it once locally (about a minute, no GPU needed):
 
 ```bash
+python -m scripts.train_ml_model
 streamlit run app.py
 ```
+
+The same model is used with the fast path on or off. The dashboard then follows the same routing as the benchmark: ML probability ≥ 0.95 takes the fast path, otherwise the LLM decides with the ML prediction as context.
+
+Security note: joblib files are pickles and can execute code when loaded. Only load model files you trained yourself.
+
+If the file is missing or fails to load (for example after a scikit-learn/xgboost version change), the dashboard still runs but falls back to retrieval scores only, so most emails with a high-scoring match are quarantined without LLM review. Retraining fixes it.
+
+Please cite the PhishFuzzer paper ("The Phish, The Spam, and The Valid: Generating Feature-Rich Emails for Benchmarking LLMs") when using results from this project.
 
 ---
 

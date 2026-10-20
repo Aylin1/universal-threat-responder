@@ -14,20 +14,21 @@ from evals.threat_evaluator import DetailedThreatEvaluator
 from config import cfg
 
 def sync_threat_feeds():
-    ingest_script = Path("scripts/ingest_threat_intel.py")
+    project_root = Path(__file__).resolve().parent.parent
+    ingest_script = project_root / "scripts" / "ingest_threat_intel.py"
     
     if ingest_script.exists():
         print("[*] Syncing threat intelligence feeds into Milvus...")
-        subprocess.run([sys.executable, str(ingest_script)], check=True)
+        subprocess.run([sys.executable, str(ingest_script)], check=True, cwd=project_root)
     else:
-        print("[!] Warning: scripts/ingest_threat_intel.py not found. Skipping vector store refresh.")
+        print(f"[!] Warning: {ingest_script} not found. Skipping vector store refresh.")
 
 def run_evaluation():
     parser = argparse.ArgumentParser(description="Run Threat Responder Evaluation")
     parser.add_argument("--disable-fast-path", action="store_true", help="Disable ML fast-path bypass")
     parser.add_argument("--enable-fast-path", action="store_true", help="Enable ML fast-path bypass")
     parser.add_argument("--high-bound", type=float, help="Upper probability bound for auto-block")
-    parser.add_argument("--low-bound", type=float, help="Lower probability bound for auto-allow")
+    parser.add_argument("--low-bound", type=float, help="Lower probability bound used for the evaluator's epistemic-uncertainty flag (not for routing)")
     parser.add_argument("--sample-fraction", type=float, help="Fraction of dataset to test")
     parser.add_argument("--dataset-path", type=str, help="Override JSON/CSV dataset path")
     args = parser.parse_args()
@@ -120,6 +121,7 @@ def run_evaluation():
             agent_action = decision.action.upper()
             agent_reasoning = decision.reasoning
             agent_confidence = getattr(decision, "confidence", 0.0)
+            guard_applied = getattr(decision, "metadata", {}).get("guard_applied", "none")
             route_taken = getattr(decision, "metadata", {}).get(
                 "evaluation_mode", 
                 signal.context.get("evaluation_mode", "UNKNOWN")
@@ -128,6 +130,7 @@ def run_evaluation():
             agent_action = "QUARANTINE"
             agent_reasoning = f"Graph execution failed: {str(e)}"
             agent_confidence = 0.0
+            guard_applied = "none"
             route_taken = "FALLBACK"
 
         llm_payload = {
@@ -145,6 +148,7 @@ def run_evaluation():
             "true_label": true_label,
             "agent_action": agent_action,
             "route_taken": route_taken,
+            "guard_applied": guard_applied,
             "agent_confidence": agent_confidence,
             "label_match": is_exact_match,
             "is_quarantined": is_quarantined,

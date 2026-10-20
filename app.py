@@ -1,6 +1,7 @@
 import io
 import hashlib
 import random
+from pathlib import Path
 import streamlit as st
 
 import pymupdf as fitz  
@@ -16,6 +17,7 @@ except ImportError:
 
 from langchain_ollama import ChatOllama
 from adapters.rag_spam_adapter import RAGSpamAdapter
+from adapters.phishfuzzer_loader import EmailThreatClassifier
 from src.core import ThreatResponderGraph, SecurityTools
 from src.domain_interface import ThreatSignal
 from src.input_parsers import parse_csv_samples, parse_json_samples
@@ -46,6 +48,21 @@ def load_threat_engine():
     )
     return adapter, graph
 
+
+@st.cache_resource
+def load_ml_classifier():
+    """Return the saved email classifier, or None if it has not been trained yet."""
+    model_file = Path(cfg.paths.model_path)
+    if not model_file.exists():
+        return None
+    try:
+        return EmailThreatClassifier.load(str(model_file))
+    except Exception as exc:
+        st.sidebar.error(
+            f"Could not load {model_file} ({type(exc).__name__}). It was likely trained with different "
+            "scikit-learn/xgboost versions. Retrain with `python -m scripts.train_ml_model`."
+        )
+        return None
 def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
     """Multi-engine PDF text extractor with automatic OCR fallback for image/outlined PDFs."""
     st.write("### 🛠️ PDF Extraction Pipeline")
@@ -110,12 +127,21 @@ def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
 
 with st.spinner("Initializing Milvus vector database and local LLM graph..."):
     adapter, agent = load_threat_engine()
+ml_classifier = load_ml_classifier()
 
 # Sidebar Telemetry View
 st.sidebar.header("Engine Telemetry Configuration")
 st.sidebar.text(f"Fast-Path Enabled: {cfg.conformal.use_fast_path}")
 st.sidebar.text(f"Conformal Bounds: [{cfg.conformal.low_bound}, {cfg.conformal.high_bound}]")
 st.sidebar.text(f"Model: {cfg.llm.model_name}")
+if ml_classifier is not None:
+    st.sidebar.success("ML classifier loaded")
+else:
+    st.sidebar.warning(
+        "ML classifier not found. Using retrieval scores only, so any top match "
+        f"scoring ≥ {cfg.conformal.high_bound} is quarantined without the LLM. "
+        "Run `python -m scripts.train_ml_model` to enable it."
+    )
 
 email_text = ""
 samples = []
@@ -149,7 +175,13 @@ with input_tab2:
     )
 
     if uploaded_pdf is not None:
-        extracted_text = extract_pdf_text_diagnostic(uploaded_pdf.getvalue())
+        pdf_bytes = uploaded_pdf.getvalue()
+        pdf_key = hashlib.sha256(pdf_bytes).hexdigest()
+        # Streamlit reruns the script on every interaction; extract (and OCR) each PDF only once.
+        if st.session_state.get("pdf_text_key") != pdf_key:
+            st.session_state.pdf_text = extract_pdf_text_diagnostic(pdf_bytes)
+            st.session_state.pdf_text_key = pdf_key
+        extracted_text = st.session_state.pdf_text
 
         if extracted_text:
             samples = [{
@@ -205,11 +237,9 @@ if samples:
 
 submitted = st.button("🚀 Analyze Threat Signal(s)", type="primary")
 
-uploaded_bytes = None
-if uploaded_pdf is not None:
-    uploaded_bytes = uploaded_pdf.getvalue()
-elif uploaded_batch is not None:
-    uploaded_bytes = uploaded_batch.getvalue()
+uploaded_bytes = b"".join(
+    upload.getvalue() for upload in (uploaded_pdf, uploaded_batch) if upload is not None
+) or None
 
 upload_signature = (
     hashlib.sha256(uploaded_bytes).hexdigest()
@@ -240,11 +270,18 @@ if analyze_requested:
                         },
                     )
 
+                    risk_score = context.get("max_risk_score", 0.50)
+                    if ml_classifier is not None:
+                        ml_class, ml_prob = ml_classifier.predict_text(sample["text"])
+                        context["ml_predicted_class"] = ml_class
+                        context["ml_probability"] = ml_prob
+                        risk_score = ml_prob
+
                     signal = ThreatSignal(
                         signal_id=f"ST-{random.randint(100000, 999999)}",
                         domain="spam_phishing",
                         raw_payload=sample["text"],
-                        risk_score=context.get("max_risk_score", 0.50),
+                        risk_score=risk_score,
                         confidence=0.85,
                         context=context,
                     )
@@ -297,6 +334,11 @@ if analyze_requested:
                 context = result["Context"]
 
                 st.info(decision.reasoning)
+                if "ml_predicted_class" in context:
+                    st.write(
+                        f"**ML Classifier:** `{context['ml_predicted_class']}` "
+                        f"(calibrated probability {context['ml_probability']:.2%})"
+                    )
                 st.write(f"**Audit ID:** `{decision.audit_id}`")
                 st.write(f"**High-Risk Matches:** `{context.get('high_risk_hits', 0)}`")
                 st.write(
@@ -317,5 +359,5 @@ if analyze_requested:
                 st.write("**Decision Metadata:**")
                 st.json(decision.metadata)
 
-        if new_upload:
-            st.session_state.last_analyzed_upload = upload_signature
+    if new_upload:
+        st.session_state.last_analyzed_upload = upload_signature

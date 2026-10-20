@@ -12,9 +12,11 @@ from langchain_milvus import Milvus
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter
+from config import cfg
 
-MILVUS_URI = "./data/milvus_threat_intel.db"
-COLLECTION_NAME = "phishing_threat_intel"
+MILVUS_URI = cfg.vector_store.uri
+# Separate from the live-intel collection, which ingest_threat_intel.py rebuilds on every evaluation run.
+COLLECTION_NAME = cfg.vector_store.training_collection
 
 def populate_milvus_from_phishfuzzer():
     print("Loading leakage-free dataset split...")

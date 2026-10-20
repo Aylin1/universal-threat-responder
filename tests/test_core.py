@@ -137,3 +137,20 @@ def test_non_numeric_confidence_keeps_parsed_action(tmp_path):
 
     assert decision.action == "VALID"
     assert decision.confidence == 0.5
+
+
+def test_low_confidence_llm_decision_is_quarantined(tmp_path):
+    llm = MagicMock()
+    llm.invoke.return_value.content = '{"action":"VALID","confidence":0.3,"reasoning":"Unsure."}'
+    graph = ThreatResponderGraph(
+        llm=llm,
+        tools=SecurityTools(str(tmp_path / "audit.jsonl")),
+        confidence_threshold=0.5,
+        use_fast_path=False,
+    )
+
+    decision = graph.respond(make_signal(0.5), MockAdapter())
+
+    assert decision.action == "QUARANTINE"
+    assert decision.metadata["low_confidence_guard_applied"] is True
+    assert decision.metadata["guard_applied"] == "low_confidence"

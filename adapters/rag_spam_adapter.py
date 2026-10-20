@@ -8,9 +8,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from src.domain_interface import DomainAdapter, ThreatSignal
 from config import cfg
 
-# Cosine similarity floor; equals the previous `1 - L2` cutoff of 0.10 (cos = 1 - d / 2).
-MIN_RELEVANT_SIMILARITY = 0.55
-
 DEFAULT_POLICIES = [
     "SOP-101: ALLOW legitimate corporate correspondence, benign newsletters, and verifiable automated alerts.",
     "SOP-102: QUARANTINE unsolicited bulk commercial email, promotional marketing, or high-volume spam.",
@@ -25,6 +22,23 @@ def compute_shannon_entropy(p: float) -> float:
 def l2_to_cosine_similarity(distance: float) -> float:
     """Milvus returns squared L2 distance; for unit-norm embeddings cosine = 1 - d / 2."""
     return max(0.0, min(1.0, 1.0 - float(distance) / 2.0))
+
+_URL_PATTERN = re.compile(r'https?://[^\s]+')
+_INDICATOR_URL_PATTERN = re.compile(r'Target URL:\s*(\S+)')
+
+
+def _normalize_url(url: str) -> str:
+    url = url.strip().strip(".,;:!?)>]}\"'").lower()
+    return re.sub(r'^https?://(?:www\.)?', '', url).rstrip('/')
+
+
+def email_contains_indicator(raw_input: str, indicator_content: str) -> bool:
+    """True when a URL listed as `Target URL:` in a threat-intel record appears verbatim in the email."""
+    indicators = {_normalize_url(u) for u in _INDICATOR_URL_PATTERN.findall(indicator_content)}
+    if not indicators:
+        return False
+    email_urls = {_normalize_url(u) for u in _URL_PATTERN.findall(raw_input)}
+    return bool(indicators & email_urls)
 
 class RAGSpamAdapter(DomainAdapter):
     def __init__(
@@ -83,7 +97,7 @@ class RAGSpamAdapter(DomainAdapter):
 
     def build_context(self, raw_input: str, metadata: dict = None) -> dict:
         search_results = self.vector_store.similarity_search_with_score(
-            query=raw_input, 
+            query=self._extract_search_query(raw_input),
             k=5
         )
 
@@ -91,6 +105,8 @@ class RAGSpamAdapter(DomainAdapter):
         max_risk_score = 0.0
         max_risk_sop = ""
         high_risk_hits = 0
+        high_risk_similarity = 0.0
+        ioc_match = False
         top_threat_source = "Known Threat Intelligence" 
 
         for doc, score in search_results:
@@ -102,7 +118,7 @@ class RAGSpamAdapter(DomainAdapter):
             calculated_risk = l2_to_cosine_similarity(distance)
 
             # --- FILTER OUT IRRELEVANT MATCHES ---
-            if calculated_risk < MIN_RELEVANT_SIMILARITY:
+            if calculated_risk < cfg.vector_store.min_similarity_cutoff:
                 continue
             # -------------------------------------
             
@@ -111,6 +127,10 @@ class RAGSpamAdapter(DomainAdapter):
             
             if risk >= cfg.risk.high_risk_threshold:
                 high_risk_hits += 1
+                high_risk_similarity = max(high_risk_similarity, calculated_risk)
+
+            if email_contains_indicator(raw_input, content):
+                ioc_match = True
 
             # Derive SOP / Category fallback
             sop_id = doc_meta.get("sop_id")
@@ -156,6 +176,8 @@ class RAGSpamAdapter(DomainAdapter):
             "max_risk_score": max_risk_score,
             "max_risk_sop": max_risk_sop,
             "high_risk_hits": high_risk_hits,
+            "high_risk_similarity": high_risk_similarity,
+            "ioc_match": ioc_match,
             "threat_source": top_threat_source,
             "retrieval_confidence": max([l2_to_cosine_similarity(m["Vector Distance"]) for m in retrieved_matches], default=0.0),
             "retrieved_policies": DEFAULT_POLICIES

@@ -1,18 +1,27 @@
 import os
+import sys
 import csv
 import requests
+from pathlib import Path
 from typing import List, Dict, Any
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_milvus import Milvus
 
+from config import cfg
+
 # Configuration Constants
-MILVUS_URI = "./data/milvus_threat_intel.db"
-COLLECTION_NAME = "phishing_threat_intel"
+MILVUS_URI = cfg.vector_store.uri
+COLLECTION_NAME = cfg.vector_store.phishing_collection
 
 # Phishing & Live Payload Endpoints
-OPENPHISH_URL = "https://openphish.com/feed.txt"
-URLHAUS_CSV_URL = "https://urlhaus.abuse.ch/downloads/csv_recent/"
+OPENPHISH_URL = cfg.feeds.openphish_url
+URLHAUS_CSV_URL = cfg.feeds.urlhaus_csv_url
 
 
 def fetch_phishing_and_live_iocs() -> List[Document]:
@@ -188,5 +197,5 @@ def sync_to_milvus():
 
 
 if __name__ == "__main__":
-    os.makedirs("./data", exist_ok=True)
+    os.makedirs(os.path.dirname(MILVUS_URI) or ".", exist_ok=True)
     sync_to_milvus()
