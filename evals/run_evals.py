@@ -1,211 +1,187 @@
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
+
 import pandas as pd
-from sklearn.metrics import precision_score, recall_score, f1_score
 from langchain_ollama import ChatOllama
 
-from src.core import ThreatResponderGraph, SecurityTools
-from adapters.rag_spam_adapter import RAGSpamAdapter
 from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter
-from evals.threat_evaluator import DetailedThreatEvaluator
+from adapters.rag_spam_adapter import RAGSpamAdapter
 from config import cfg
+from evals.analyze_results import summarize, to_markdown
+from evals.threat_evaluator import DetailedThreatEvaluator
+from src.config_access import cfg_get
+from src.core import SecurityTools, ThreatResponderGraph
 
-def sync_threat_feeds():
-    ingest_script = Path("scripts/ingest_threat_intel.py")
-    
-    if ingest_script.exists():
-        print("[*] Syncing threat intelligence feeds into Milvus...")
-        subprocess.run([sys.executable, str(ingest_script)], check=True)
-    else:
-        print("[!] Warning: scripts/ingest_threat_intel.py not found. Skipping vector store refresh.")
+MANIFEST_PATH = Path("./data/history_manifest.json")
+
+
+def sync_threat_feeds(refresh: bool):
+    """Builds/refreshes the pattern collection and IOC snapshot. It does NOT touch the email-history
+    collection (the old version of this step silently wiped it before every run)."""
+    script = Path("scripts/ingest_threat_intel.py")
+    if not script.exists():
+        print("[!] scripts/ingest_threat_intel.py not found; skipping feed sync.")
+        return
+    cmd = [sys.executable, str(script)] + (["--refresh-feeds"] if refresh else [])
+    subprocess.run(cmd, check=True)
+
+
+def verify_history_index(loader: PhishFuzzerDatasetAdapter):
+    if not MANIFEST_PATH.exists():
+        raise SystemExit("No data/history_manifest.json: run `python scripts/populate_phishing_vectorstore.py` first "
+                         "(the retrieval index of labelled training emails has not been built).")
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    if manifest.get("split_fingerprint") != loader.split_fingerprint():
+        raise SystemExit("The indexed email history was built from a DIFFERENT split (dataset/seed/fold changed). "
+                         "Re-run scripts/populate_phishing_vectorstore.py with the same --dataset-path and --fold.")
+    print(f"[ok] History index matches split ({manifest['n_docs']} labelled emails indexed).")
+
 
 def run_evaluation():
     parser = argparse.ArgumentParser(description="Run Threat Responder Evaluation")
-    parser.add_argument("--disable-fast-path", action="store_true", help="Disable ML fast-path bypass")
-    parser.add_argument("--enable-fast-path", action="store_true", help="Enable ML fast-path bypass")
-    parser.add_argument("--high-bound", type=float, help="Upper probability bound for auto-block")
-    parser.add_argument("--low-bound", type=float, help="Lower probability bound for auto-allow")
-    parser.add_argument("--sample-fraction", type=float, help="Fraction of dataset to test")
-    parser.add_argument("--dataset-path", type=str, help="Override JSON/CSV dataset path")
+    parser.add_argument("--disable-fast-path", action="store_true")
+    parser.add_argument("--enable-fast-path", action="store_true")
+    parser.add_argument("--alpha", type=float, help="conformal miscoverage level (default 0.05)")
+    parser.add_argument("--fold", type=int, default=0, help="outer CV fold used as test split")
+    parser.add_argument("--sample-fraction", type=float)
+    parser.add_argument("--dataset-path", type=str)
+    parser.add_argument("--llm-samples", type=int, default=1, help="LLM draws per email for self-consistency")
+    parser.add_argument("--refresh-feeds", action="store_true", help="re-download OpenPhish/URLhaus")
+    # deprecated, accepted so old command lines keep working
+    parser.add_argument("--high-bound", type=float)
+    parser.add_argument("--low-bound", type=float)
     args = parser.parse_args()
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-    # Give every evaluation run its own audit log.
     audit_log_path = Path(cfg.paths.audit_log_path)
-    cfg.paths.audit_log_path = str(
-        audit_log_path.with_name(
-            f"{audit_log_path.stem}_{run_id}{audit_log_path.suffix}"
-        )
-    )
+    cfg.paths.audit_log_path = str(audit_log_path.with_name(f"{audit_log_path.stem}_{run_id}{audit_log_path.suffix}"))
 
     if args.disable_fast_path:
         cfg.conformal.use_fast_path = False
     if args.enable_fast_path:
         cfg.conformal.use_fast_path = True
-    if args.high_bound is not None:
-        cfg.conformal.high_bound = args.high_bound
-    if args.low_bound is not None:
-        cfg.conformal.low_bound = args.low_bound
     if args.sample_fraction is not None:
         cfg.dataset.sample_fraction = args.sample_fraction
     if args.dataset_path:
         cfg.dataset.file_path = args.dataset_path
+    if args.high_bound is not None or args.low_bound is not None:
+        print("[!] --high-bound/--low-bound are deprecated: routing uses the conformal prediction set (--alpha).")
 
     cfg.ensure_directories()
-    sync_threat_feeds()
+    sync_threat_feeds(args.refresh_feeds)
 
-    print(f"\nInitializing Agent Graph with Configured Hyperparameters:")
-    print(f" - Fast Path Enabled: {cfg.conformal.use_fast_path}")
-    print(f" - Conformal Bounds:  [{cfg.conformal.low_bound:.2f}, {cfg.conformal.high_bound:.2f}]")
-    print(f" - Vector Database:   {cfg.vector_store.uri}")
-    print(f" - Dataset Path:      {cfg.dataset.file_path}\n")
+    print("\nBuilding dataset splits, fitting classifier and calibrating conformal router...")
+    loader = PhishFuzzerDatasetAdapter(file_path=cfg.dataset.file_path, alpha=args.alpha, outer_fold=args.fold)
+    loader.assert_no_leakage()
+    verify_history_index(loader)
+    leak = loader.leakage_report()
+    print("Leakage report:", json.dumps(leak))
+    print("Conformal check on held-out test split:", json.dumps(
+        {k: (round(v, 4) if isinstance(v, float) else v) for k, v in loader.conformal_report.items()
+         if k != "coverage_per_class"}))
+    print("  per-class coverage:", {k: round(v, 3) for k, v in loader.conformal_report["coverage_per_class"].items()})
 
-    llm = ChatOllama(
-        model=cfg.llm.model_name, 
-        temperature=cfg.llm.temperature, 
-        keep_alive=cfg.llm.keep_alive
-    )
+    use_fast = bool(cfg_get("conformal", "use_fast_path", True))
+    print(f"\n - Fast path enabled: {use_fast}\n - Conformal alpha:   {loader.alpha}\n"
+          f" - Vector DB:         {cfg.vector_store.uri}\n - Dataset:           {cfg.dataset.file_path}\n")
+
+    llm = ChatOllama(model=cfg.llm.model_name, temperature=cfg.llm.temperature, keep_alive=cfg.llm.keep_alive)
     tools = SecurityTools(audit_log_path=cfg.paths.audit_log_path)
+    agent = ThreatResponderGraph(llm=llm, tools=tools, uncertainty_samples=args.llm_samples,
+                                 confidence_threshold=cfg.llm.confidence_threshold, use_fast_path=use_fast)
+    evaluator = DetailedThreatEvaluator(min_similarity_cutoff=cfg.vector_store.min_similarity_cutoff)
+    adapter = RAGSpamAdapter(milvus_uri=cfg.vector_store.uri)
 
-    agent = ThreatResponderGraph(
-        llm=llm,
-        tools=tools,
-        confidence_threshold=cfg.llm.confidence_threshold,
-        use_fast_path=cfg.conformal.use_fast_path
-    )
-
-    threat_evaluator = DetailedThreatEvaluator(
-        min_similarity_cutoff=cfg.vector_store.min_similarity_cutoff,
-        high_bound=cfg.conformal.high_bound,
-        low_bound=cfg.conformal.low_bound
-    )
-
-    collection_target = getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
-    adapter = RAGSpamAdapter(
-        milvus_uri=cfg.vector_store.uri,
-        collection_name=collection_target
-    )
-    
-    dataset_loader = PhishFuzzerDatasetAdapter(file_path=cfg.dataset.file_path)
-
-    test_items = dataset_loader.load_as_test_items(
-        sample_fraction=cfg.dataset.sample_fraction,
-        seed=cfg.dataset.seed,
-        high_bound=cfg.conformal.high_bound,
-        low_bound=cfg.conformal.low_bound
-    )
+    test_items = loader.load_as_test_items(sample_fraction=cfg.dataset.sample_fraction, seed=cfg.dataset.seed)
+    print(f"Running evaluation across {len(test_items)} samples...\n")
 
     results = []
-    print(f"Running evaluation across {len(test_items)} samples with dynamic conformal routing...\n")
-
     for item in test_items:
-        email_text = item["input"]
         true_label = item["expected_action"]
 
-        context = adapter.build_context(
-            raw_input=email_text,
-            metadata={
-                "source": "enron_eval",
-                "sample_count": len(test_items),
-            }
-        )
+        t0 = perf_counter()
+        context = adapter.build_context(raw_input=item["input"],
+                                        metadata={"source": "phishfuzzer_eval", "sample_count": len(test_items)})
+        retrieval_ms = (perf_counter() - t0) * 1000
         signal = item["signal_builder"](context)
 
+        meta = {}
         try:
+            t1 = perf_counter()
             decision = agent.respond(signal=signal, adapter=adapter)
-            agent_action = decision.action.upper()
-            agent_reasoning = decision.reasoning
-            agent_confidence = getattr(decision, "confidence", 0.0)
-            route_taken = getattr(decision, "metadata", {}).get(
-                "evaluation_mode", 
-                signal.context.get("evaluation_mode", "UNKNOWN")
-            )
-        except Exception as e:
-            agent_action = "QUARANTINE"
-            agent_reasoning = f"Graph execution failed: {str(e)}"
-            agent_confidence = 0.0
-            route_taken = "FALLBACK"
+            graph_ms = (perf_counter() - t1) * 1000
+            action = decision.action.upper()
+            reasoning = decision.reasoning
+            confidence = decision.confidence if decision.confidence is not None else 0.0
+            meta = decision.metadata or {}
+            route = meta.get("evaluation_mode", signal.context.get("evaluation_mode", "UNKNOWN"))
+        except Exception as exc:
+            graph_ms = float("nan")
+            action, reasoning, confidence, route = "QUARANTINE", f"Graph execution failed: {exc}", 0.0, "FALLBACK"
 
-        llm_payload = {
-            "action": agent_action,
-            "confidence": agent_confidence,
-            "reasoning": agent_reasoning
-        }
-        telemetry = threat_evaluator.evaluate_signal(signal, llm_payload)
-
-        is_exact_match = (agent_action == true_label)
-        is_quarantined = (agent_action == "QUARANTINE")
+        tel = evaluator.evaluate_signal(signal, {"action": action, "confidence": confidence, "reasoning": reasoning})
+        ctx = signal.context
+        probs = ctx.get("ml_probs", {})
 
         results.append({
             "signal_id": signal.signal_id,
             "true_label": true_label,
-            "agent_action": agent_action,
-            "route_taken": route_taken,
-            "agent_confidence": agent_confidence,
-            "label_match": is_exact_match,
-            "is_quarantined": is_quarantined,
-            "high_risk_hits": context.get("high_risk_hits", 0),
-            "max_risk_score": context.get("max_risk_score", 0.0),
-
-            "ml_risk_prob": telemetry["ml_uncertainty"]["ml_risk_raw_probability"],
-            "ml_shannon_entropy": telemetry["ml_uncertainty"]["ml_shannon_entropy_bits"],
-            "rag_similarity": telemetry["rag_uncertainty"]["rag_top1_similarity"],
-            "structural_hallucination_rate": telemetry["hallucination_metrics"]["structural_hallucination_rate"],
-            "calibration_error": telemetry["llm_calibration"]["verbalization_calibration_error"],
-
-            "flag_epistemic_uncertainty": telemetry["vector_flags"]["high_epistemic_uncertainty"],
-            "flag_retrieval_uncertainty": telemetry["vector_flags"]["high_retrieval_uncertainty"],
-            "flag_structural_hallucination": telemetry["vector_flags"]["structural_hallucination_detected"],
-            "flag_overconfident_llm": telemetry["vector_flags"]["overconfident_llm"]
+            "agent_action": action,
+            "llm_raw_action": meta.get("llm_raw_action"),
+            "route_taken": route,
+            "agent_confidence": confidence,
+            "label_match": action == true_label,
+            "is_quarantined": action == "QUARANTINE",
+            "abstained": bool(meta.get("abstain_reason")),
+            "parse_failed": bool(meta.get("parse_failed", False)),
+            "guard_applied": bool(meta.get("policy_guard_applied", False)),
+            "guard_reasons": " | ".join(meta.get("policy_guard_reasons", [])),
+            "ml_predicted_class": ctx.get("ml_predicted_class"),
+            "ml_top_prob": tel["ml_uncertainty"]["ml_top_prob"],
+            "ml_prob_valid": probs.get("VALID"), "ml_prob_spam": probs.get("SPAM"),
+            "ml_prob_phishing": probs.get("PHISHING"),
+            "ml_entropy_bits": tel["ml_uncertainty"]["ml_entropy_bits"],
+            "ml_top2_margin": tel["ml_uncertainty"]["ml_top2_margin"],
+            "conformal_set": "|".join(ctx.get("conformal_set", [])),
+            "conformal_singleton": ctx.get("conformal_singleton"),
+            "ioc_hits": ctx.get("ioc_hits", 0),
+            "ioc_host_hits": ctx.get("ioc_host_hits", 0),
+            "nn_top_sim": ctx.get("nn_top_sim", 0.0),
+            "nn_top_label": ctx.get("nn_top_label", ""),
+            "neighbors_json": json.dumps([{"label": n["label"], "sim": n["sim"]} for n in ctx.get("neighbors", [])]),
+            "rag_similarity": tel["rag"]["rag_top1_similarity"],
+            "unsupported_citations": ",".join(tel["grounding"]["unsupported_citations"]),
+            "confidence_gap_vs_ml": tel["confidence"]["confidence_gap_vs_ml"],
+            "flag_unsupported_citation": tel["flags"]["unsupported_citation"],
+            "flag_weak_retrieval": tel["flags"]["weak_retrieval"],
+            "flag_high_ml_entropy": tel["flags"]["high_ml_entropy"],
+            "retrieval_ms": round(retrieval_ms, 2),
+            "graph_ms": round(graph_ms, 2),
+            "end_to_end_ms": round(retrieval_ms + graph_ms, 2),   # includes embedding + Milvus, unlike the old figure
         })
 
-    results_df = pd.DataFrame(results)
-    resolved_df = results_df[~results_df['is_quarantined']].copy()
+    df = pd.DataFrame(results)
+    mode = "fastpath-enabled" if use_fast else "fastpath-disabled"
+    out_csv = Path("evals") / f"live_audit_report_results_{mode}_{run_id}.csv"
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
 
-    if not resolved_df.empty:
-        y_true = resolved_df['true_label']
-        y_pred = resolved_df['agent_action']
-
-        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
-        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
-        resolved_accuracy = (y_true == y_pred).mean()
-    else:
-        precision = recall = f1 = resolved_accuracy = 0.0
-
-    fast_path_rate = (results_df['route_taken'] == 'FAST_PATH_BYPASS').mean() * 100
-
-    print("=" * 60)
-    print("📊 LIVE CONFORMAL & PROACTIVE THREAT TELEMETRY REPORT")
-    print("=" * 60)
-    print(f"Total Evaluated:                    {len(results_df)}")
-    print(f"Fast-Path Bypass Rate:              {fast_path_rate:.2f}%")
-    print(f"High-Risk Threat Indicator Hits:   {results_df['high_risk_hits'].sum()}")
-    print(f"Quarantined Action Rate:            {results_df['is_quarantined'].mean() * 100:.2f}%")
-    print("-" * 60)
-    print("UNCERTAINTY TELEMETRY METRICS:")
-    print(f"Mean ML Shannon Entropy (bits):     {results_df['ml_shannon_entropy'].mean():.4f}")
-    print(f"Mean RAG Top-1 Similarity:          {results_df['rag_similarity'].mean():.4f}")
-    print(f"Mean LLM Calibration Error:         {results_df['calibration_error'].mean():.4f}")
-    print("-" * 60)
-
-    if not resolved_df.empty:
-        print("THREAT DETECTION METRICS (Resolved Items Only):")
-        print(f"Accuracy:                           {resolved_accuracy * 100:.2f}%")
-        print(f"Precision (Macro 3-Class):          {precision * 100:.2f}%")
-        print(f"Recall (Macro 3-Class):             {recall * 100:.2f}%")
-        print(f"F1-Score (Macro 3-Class):           {f1:.3f}")
-    print("=" * 60)
-
-    mode = "fastpath-enabled" if cfg.conformal.use_fast_path else "fastpath-disabled"
-    output_path = Path("evals") / f"live_audit_report_results_{mode}_{run_id}.csv"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(output_path, index=False)
-    print(f"Saved detailed telemetry log to `{output_path}`")
+    summary = summarize(df)
+    md = to_markdown(summary, title=f"Evaluation {run_id} ({mode}, alpha={loader.alpha}, fold={args.fold})")
+    md += ("\n## Latency (ms, per email)\n\n"
+           f"- retrieval (embedding + Milvus): mean {df['retrieval_ms'].mean():.1f}\n"
+           f"- graph (LLM or bypass node only): mean {df['graph_ms'].mean():.1f}\n"
+           f"- end-to-end: mean {df['end_to_end_ms'].mean():.1f}, p95 {df['end_to_end_ms'].quantile(0.95):.1f}\n"
+           f"\n## Data integrity\n\n```json\n{json.dumps(leak, indent=1)}\n```\n")
+    out_md = out_csv.with_suffix(".md")
+    out_md.write_text(md, encoding="utf-8")
+    print(md)
+    print(f"\nSaved telemetry to `{out_csv}` and report to `{out_md}`")
 
 
 if __name__ == "__main__":
