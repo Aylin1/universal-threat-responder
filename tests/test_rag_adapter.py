@@ -50,6 +50,21 @@ def test_neighbors_use_label_metadata_and_cosine_conversion(make_adapter):
     assert abs(ctx["nn_top_sim"] - 0.9) < 1e-3 and ctx["nn_top_label"] == "PHISHING"
 
 
+def test_review_policies_are_top_three_relevant_retrieved_patterns(make_adapter):
+    patterns = [(Doc("policy " + str(i), {"sop_id": f"SOP-{i}"}), _l2(sim))
+                for i, sim in enumerate([0.6, 0.9, 0.7, 0.8, 0.4])]
+    ctx = make_adapter(patterns=patterns).build_context("some email")
+    assert [p["sop_id"] for p in ctx["review_policies"]] == ["SOP-1", "SOP-3", "SOP-2"]
+
+
+def test_review_policies_deduplicate_sops_and_include_policy_text(make_adapter):
+    patterns = [(Doc("pattern", {"sop_id": sop}), _l2(sim))
+                for sop, sim in [("SOP-104", 0.95), ("SOP-104", 0.9), ("SOP-103", 0.8)]]
+    policies = make_adapter(patterns=patterns).build_context("email")["review_policies"]
+    assert [p["sop_id"] for p in policies] == ["SOP-104", "SOP-103"]
+    assert policies[0]["policy"].startswith("SOP-104:")
+
+
 def test_ioc_exact_hit_populates_context(make_adapter):
     ctx = make_adapter(ioc=[{"indicator_id": "OPENPHISH-1", "url": "http://bad.test/a", "source": "openphish_live"}]
                        ).build_context("click http://bad.test/a now")

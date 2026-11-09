@@ -5,3 +5,5 @@ __pycache__/
 .deepeval/
 logs/
 /data
+/evals/runs/
+/evals/results/

@@ -20,7 +20,7 @@ class ThreatFeedsConfig:
 
 @dataclass
 class FastPathConformalConfig:
-    use_fast_path: bool = True  # Default enabled matching README benchmark runs
+    use_fast_path: bool = False
     high_bound: float = 0.95    # Fast-path AUTO-BLOCK threshold (risk_score >= high_bound)
     low_bound: float = 0.05     # Fast-path AUTO-ALLOW threshold (risk_score <= low_bound)
 
@@ -51,7 +51,7 @@ class DatasetConfig:
 class PathsConfig:
     data_dir: str = "./data"
     audit_log_path: str = "logs/eval_audit.log"
-    report_output_path: str = "evals/live_audit_report_results.csv"
+    report_output_path: str = "evals/results/live_audit_report_results.csv"
 
 
 @dataclass

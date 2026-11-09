@@ -305,6 +305,37 @@ class PhishFuzzerDatasetAdapter:
             return "VALID"
         return "QUARANTINE"
 
+    def classify_text(self, text: str) -> Dict[str, Any]:
+        """Classify a new email using the same subject/body and structural features as training."""
+        if self.router is None or self.ml_classifier is None or self.vectorizer is None:
+            raise RuntimeError("Models not fitted (fit_models=False)")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Email text must not be empty")
+        fields = {"Subject": "", "Body": text, "Sender": "", "Url": "", "File": ""}
+        header, separator, body = text.partition("\n\n")
+        names = {"subject": "Subject", "sender": "Sender", "from": "Sender",
+                 "links": "Url", "url": "Url", "attachments": "File", "file": "File"}
+        parsed = {}
+        for line in header.splitlines():
+            name, colon, value = line.partition(":")
+            if not colon or name.strip().lower() not in names:
+                parsed = {}
+                break
+            parsed[names[name.strip().lower()]] = value.strip()
+        if separator and parsed:
+            fields.update(parsed)
+            fields["Body"] = re.sub(r"^Body:\s*\n?", "", body, count=1, flags=re.IGNORECASE)
+        frame = pd.DataFrame([fields])
+        frame["full_text"] = frame["Subject"] + "\n" + frame["Body"]
+        probs = self.ml_classifier.predict_proba(self._featurize(frame))[0]
+        decision = self.router.predict_one(probs)
+        return {
+            "ml_predicted_class": self.classes[int(np.argmax(probs))],
+            "ml_probs": {c: float(p) for c, p in zip(self.classes, probs)},
+            "conformal_set": list(decision.prediction_set),
+            "conformal_singleton": decision.is_singleton,
+        }
+
     def load_as_test_items(self, sample_fraction: float = None, seed: int = None,
                            high_bound: float = None, low_bound: float = None) -> List[Dict[str, Any]]:
         """high_bound/low_bound are accepted for backward compatibility and ignored:

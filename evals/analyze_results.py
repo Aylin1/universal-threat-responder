@@ -1,6 +1,6 @@
 """Offline analysis of an evaluation CSV (no LLM, no Milvus needed).
 
-    python -m evals.analyze_results evals/live_audit_report_results_*.csv --out benchmark_results_generated.md
+    python -m evals.analyze_results "evals/results/historical/live_audit_report_results_*.csv"
 
 Why this exists: the old headline ("accuracy 85.8% -> 90.0%") was accuracy on RESOLVED rows only,
 so enabling the fast path partly changed WHICH rows were scored. This report always shows, side
@@ -83,15 +83,20 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
     out: Dict[str, Any] = {"n": int(len(df))}
 
     systems: List[Dict[str, Any]] = []
-    if "ml_predicted_class" in df.columns:
+    if "ml_predicted_class" in df.columns and df["ml_predicted_class"].isin(LABELS).all():
         ml = df["ml_predicted_class"]
         systems.append(_system_metrics(true, ml, "ML only (argmax, no abstention)"))
         if "conformal_singleton" in df.columns:
-            ml_abs = ml.where(df["conformal_singleton"], ABSTAIN)
+            singleton_prediction = df["conformal_set"] if "conformal_set" in df.columns else ml
+            ml_abs = singleton_prediction.where(df["conformal_singleton"] & singleton_prediction.isin(LABELS), ABSTAIN)
             systems.append(_system_metrics(true, ml_abs, "ML + conformal (abstain unless singleton set)"))
-    systems.append(_system_metrics(true, pred, "FULL: conformal fast-path + RAG/LLM + guard"))
+    else:
+        out["ml_baseline_unavailable"] = True
+    full_name = ("FULL: agreement review + RAG/LLM" if "review_reasons" in df.columns
+                 else "FULL: conformal fast-path + RAG/LLM + guard")
+    systems.append(_system_metrics(true, pred, full_name))
 
-    if "guard_applied" in df.columns and "llm_raw_action" in df.columns:
+    if "guard_applied" in df.columns and "llm_raw_action" in df.columns and "review_reasons" not in df.columns:
         no_guard = pred.copy()
         mask = df["guard_applied"] & df["llm_raw_action"].notna()
         no_guard[mask] = df.loc[mask, "llm_raw_action"]
@@ -111,7 +116,7 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
     out["confusion"] = confusion_with_abstain(true, pred)
 
     # ---- coverage-accuracy curve for the ML model alone (threshold sweep)
-    if "ml_top_prob" in df.columns and "ml_predicted_class" in df.columns:
+    if not out.get("ml_baseline_unavailable") and "ml_top_prob" in df.columns and df["ml_top_prob"].notna().all():
         curve = []
         for t in [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99]:
             m = df["ml_top_prob"] >= t
@@ -122,7 +127,7 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
 
     # ---- calibration against CORRECTNESS (not against another model)
     cal: Dict[str, Any] = {}
-    if "ml_top_prob" in df.columns and "ml_predicted_class" in df.columns:
+    if not out.get("ml_baseline_unavailable") and "ml_top_prob" in df.columns and df["ml_top_prob"].notna().all():
         ok = (df["ml_predicted_class"] == true).values
         ece, _ = expected_calibration_error(df["ml_top_prob"].values, ok)
         cal["ml_ece"], cal["ml_brier"] = ece, brier_score(df["ml_top_prob"].values, ok)
@@ -139,7 +144,7 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
     out["calibration"] = cal
 
     # ---- policy-guard impact (only meaningful on rows where the LLM said VALID)
-    if "guard_applied" in df.columns and "llm_raw_action" in df.columns:
+    if "guard_applied" in df.columns and "llm_raw_action" in df.columns and "review_reasons" not in df.columns:
         v = df["llm_raw_action"] == "VALID"
         if v.any():
             vetoed = v & df["guard_applied"]
@@ -183,6 +188,8 @@ def to_markdown(s: Dict[str, Any], title: str = "Benchmark results (generated)")
         L.append(f"| {m['system']} | {_pct(m['coverage'])} | {_pct(m['resolved_accuracy'])}{_ci(m['resolved_ci'])} | "
                  f"{_pct(m['end_to_end_accuracy'])}{_ci(m['end_to_end_ci'])} | {_pct(m['leak_rate'])} | "
                  f"{_pct(m['false_block_rate'])} |")
+    if s.get("ml_baseline_unavailable"):
+        L += ["", "ML baseline omitted: one or more rows have missing or invalid ML predictions."]
     L += ["", "Leak rate = spam/phishing auto-ALLOWED / all spam+phishing. "
           "False-block rate = valid mail auto-blocked or spam-filtered / all valid mail.", "",
           "## By route", "", "| Route | Share | Coverage | Resolved acc. | End-to-end acc. |", "|---|---|---|---|---|"]
@@ -224,10 +231,12 @@ def load_many(patterns: List[str]) -> pd.DataFrame:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("csv", nargs="+")
-    ap.add_argument("--out", default="benchmark_results_generated.md")
+    ap.add_argument("--out", default="evals/results/generated/benchmark_results_generated.md")
     a = ap.parse_args()
     summary = summarize(load_many(a.csv))
     md = to_markdown(summary)
-    Path(a.out).write_text(md, encoding="utf-8")
+    output = Path(a.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(md, encoding="utf-8")
     print(md)
     print(f"\nWrote {a.out}")

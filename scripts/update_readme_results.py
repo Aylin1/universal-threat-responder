@@ -1,111 +1,81 @@
-"""Refresh the benchmark_results.md performance tables from the latest eval report CSVs.
-
-Usage: python -m scripts.update_readme_results
-"""
+"""Refresh benchmark_results.md from the newest run of each evaluation mode."""
 import re
-import sys
 from pathlib import Path
 
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DOC = ROOT / "benchmark_results.md"
-REPORT_GLOB = "live_audit_report_results_*.csv"
-START, END = "<!-- PERF:START -->", "<!-- PERF:END -->"
-
-
-NAME_RE = re.compile(r"live_audit_report_results_(?:fastpath-(enabled|disabled)_)?(.+)$")
-
-
-def run_id(path: Path) -> str:
-    return NAME_RE.match(path.stem).group(2)
+NAME_RE = re.compile(
+    r"live_audit_report_results_(fastpath-enabled|fastpath-disabled|agreement-review)_(\d{8}_\d{6}_\d+)$"
+)
 
 
 def latest_reports():
-    """Return the newest report per mode (run ids are timestamps, so they sort).
-
-    The mode comes from the file name; legacy files without it are classified by content.
-    """
     latest = {}
-    for path in sorted((ROOT / "evals").glob(REPORT_GLOB), key=run_id):
-        df = pd.read_csv(path)
-        mode = NAME_RE.match(path.stem).group(1)
-        if mode is None:
-            mode = "enabled" if (df["route_taken"] == "FAST_PATH_BYPASS").any() else "disabled"
-        latest[mode] = (path, df)
+    evals = ROOT / "evals"
+    paths = list(evals.glob("live_audit_report_results_*.csv"))
+    paths.extend((evals / "runs").glob("*/live_audit_report_results_*.csv"))
+    paths.extend((evals / "results" / "historical").glob("live_audit_report_results_*.csv"))
+    paths.extend((evals / "results" / "runs").glob("*/live_audit_report_results_*.csv"))
+    for path in paths:
+        match = NAME_RE.fullmatch(path.stem)
+        if match and (match.group(1) not in latest or match.group(2) > latest[match.group(1)][0]):
+            latest[match.group(1)] = (match.group(2), path)
     return latest
 
 
-def compute(df: pd.DataFrame) -> dict:
-    quarantined = df["is_quarantined"].astype(bool)
-    resolved = df[~quarantined]
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        resolved["true_label"], resolved["agent_action"], average="macro", zero_division=0
-    )
-    return {
-        "samples": f"{len(df):,}",
-        "bypass": f"{(df['route_taken'] == 'FAST_PATH_BYPASS').mean() * 100:.2f}%",
-        "acc": f"{accuracy_score(resolved['true_label'], resolved['agent_action']) * 100:.2f}%",
-        "prec": f"{precision * 100:.2f}%",
-        "rec": f"{recall * 100:.2f}%",
-        "f1": f"{f1:.3f}",
-        "quar": f"{quarantined.mean() * 100:.2f}%",
-        "ent": f"{df['ml_shannon_entropy'].mean():.4f} bits",
-        "rag": f"{df['rag_similarity'].mean():.4f}",
-        "cal": f"{df['calibration_error'].mean():.4f}",
-        "hits": int(df["high_risk_hits"].sum()),
-    }
-
-
-def render(reports: dict) -> str:
-    cols = {m: compute(df) for m, (_, df) in reports.items()}
-    na = {k: "n/a" for k in next(iter(cols.values()))}
-    en, dis = cols.get("enabled", na), cols.get("disabled", na)
-    rows = [
-        ("Samples", "samples"), ("Fast-Path Bypass", "bypass"), ("Accuracy", "acc"),
-        ("Macro Precision", "prec"), ("Macro Recall", "rec"), ("Macro F1", "f1"),
-        ("Quarantined Rate", "quar"), ("Mean ML Entropy", "ent"),
-        ("Mean RAG Top-1 Similarity", "rag"), ("Mean LLM Calibration Error", "cal"),
-    ]
+def render(reports):
     lines = [
-        "| Metric | Fast-Path Enabled | Fast-Path Disabled |",
-        "| :--- | :---: | :---: |",
-    ]
-    lines += [f"| **{label}** | {en[k]} | {dis[k]} |" for label, k in rows]
-    ids = ", ".join(
-        f"fast-path {m} = `{run_id(reports[m][0])}`" for m in ("enabled", "disabled") if m in reports
-    )
-    lines += [
+        "# Benchmark results",
         "",
-        f"Latest runs: {ids}. Metrics are computed on resolved (non-quarantined) rows. "
-        "Refresh with `python -m scripts.update_readme_results`.",
+        "Latest timestamped runs per mode. Historical fast-path runs use the old LLM/guard policy; "
+        "they do not measure the current agreement-review policy.",
         "",
-        f"High-risk threat indicator hits (latest enabled run): **{en['hits']:,}**"
-        if "enabled" in reports else "",
+        "| Mode | Run | Samples | Coverage | Resolved accuracy | End-to-end accuracy | Leak rate | False-block rate |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
-    return "\n".join(lines).rstrip()
+    for mode in ("fastpath-enabled", "fastpath-disabled", "agreement-review"):
+        if mode not in reports:
+            lines.append(f"| {mode} | Not run | — | — | — | — | — | — |")
+            continue
+        run_id, path = reports[mode]
+        df = pd.read_csv(path)
+        true, pred = df["true_label"], df["agent_action"]
+        decided = pred != "QUARANTINE"
+        correct = pred == true
+        bad, good = true != "VALID", true == "VALID"
+        pct = lambda x: f"{100 * x:.1f}%"
+        resolved = pct(correct[decided].mean()) if decided.any() else "n/a"
+        leak = pct(((pred == "VALID") & bad).sum() / bad.sum()) if bad.any() else "n/a"
+        false_block = pct((decided & (pred != "VALID") & good).sum() / good.sum()) if good.any() else "n/a"
+        report = path.with_suffix(".md")
+        link = f"[{run_id}]({report.as_posix().replace(ROOT.as_posix() + '/', '')})" if report.exists() else run_id
+        lines.append(f"| {mode} | {link} | {len(df):,} | {pct(decided.mean())} | {resolved} | "
+                     f"{pct(correct.mean())} | {leak} | {false_block} |")
+    lines.extend([
+        "",
+        "Coverage is the share not quarantined. Resolved accuracy is measured only on those decisions; "
+        "end-to-end accuracy counts quarantine as incorrect. Leak rate is the share of non-benign mail "
+        "automatically marked VALID; false-block rate is the share of valid mail classified SPAM or PHISHING.",
+        "",
+        "Refresh with `python -m scripts.update_readme_results`. Each linked report contains its latency "
+        "and data-integrity measurements. Runs may not be directly comparable if their dataset, split, "
+        "model, feeds, or policy differs.",
+        "",
+    ])
+    return "\n".join(lines)
 
 
-def main() -> int:
+def main():
     reports = latest_reports()
     if not reports:
-        print("No eval reports found in evals/. Run `python -m evals.run_evals` first.")
-        return 1
-    text = RESULTS_DOC.read_text(encoding="utf-8")
-    if START not in text or END not in text:
-        print(f"{RESULTS_DOC.name} is missing the {START} / {END} markers.")
-        return 1
-    block = f"{START}\n{render(reports)}\n{END}"
-    text = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _: block, text, flags=re.S)
-    if "disabled" not in reports:
-        print("Warning: no fast-path-disabled report found; column left as n/a.")
-    RESULTS_DOC.write_text(text, encoding="utf-8", newline="\n")
-    for mode, (path, _) in reports.items():
+        raise SystemExit("No timestamped evaluation reports found in evals/.")
+    RESULTS_DOC.write_text(render(reports), encoding="utf-8")
+    for mode, (_, path) in sorted(reports.items()):
         print(f"{mode}: {path.name}")
     print(f"{RESULTS_DOC.name} updated.")
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

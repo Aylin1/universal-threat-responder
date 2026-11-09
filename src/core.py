@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 import uuid
 from collections import Counter
@@ -13,6 +14,7 @@ from langgraph.graph import StateGraph, START, END
 
 from src.config_access import cfg_get
 from src.domain_interface import ThreatSignal, DecisionOutput, DomainAdapter
+from src.guard import evaluate_agreement_review
 from src.metrics import compute_shannon_entropy, distribution_entropy
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,7 @@ class ThreatResponderGraph:
         uncertainty_samples: int = 1,
         confidence_threshold: float = 0.50,
         use_fast_path: bool = True,
+        require_agreement_review: bool = False,
     ):
         """
         uncertainty_samples: number of LLM draws for self-consistency voting. Only
@@ -127,6 +130,9 @@ class ThreatResponderGraph:
         self.uncertainty_samples = max(1, int(uncertainty_samples))
         self.confidence_threshold = float(confidence_threshold)
         self.use_fast_path = use_fast_path
+        self.require_agreement_review = require_agreement_review
+        if require_agreement_review and use_fast_path:
+            raise ValueError("Agreement review requires the fast path to be disabled")
         self.graph = self._build_graph()
 
     def _get_device_name(self) -> str:
@@ -148,6 +154,8 @@ class ThreatResponderGraph:
         use_fp = self.use_fast_path
 
         def _route(state: AgentState) -> str:
+            if self.require_agreement_review:
+                return "escalate_to_llm"
             return route_threat_signal(state, use_fast_path=use_fp)
 
         builder.add_conditional_edges(
@@ -201,8 +209,9 @@ class ThreatResponderGraph:
         entropy = (distribution_entropy(probs.values()) if probs
                    else compute_shannon_entropy(confidence))
 
-        pred_class = sig.context.get("ml_predicted_class", adapter.fallback_action)
         cset = sig.context.get("conformal_set")
+        pred_class = cset[0] if sig.context.get("conformal_singleton") and len(cset or []) == 1 \
+            else sig.context.get("ml_predicted_class", adapter.fallback_action)
         basis = (f"conformal singleton set {{{', '.join(cset)}}}" if cset
                  else f"calibrated probability {confidence:.4f}")
         reasoning = f"Fast-path classified as {pred_class} via {basis} (p={confidence:.4f})."
@@ -243,7 +252,8 @@ class ThreatResponderGraph:
         'this is not phishing' into PHISHING. Ambiguous text now abstains and is flagged.
         """
         fail = {"action": adapter.fallback_action, "confidence": 0.0,
-                "reasoning": "Failed to parse LLM response; abstaining.", "parse_failed": True}
+                "reasoning": "Failed to parse LLM response; abstaining.", "parse_failed": True,
+                "confidence_reported": False}
         if not raw_text or not isinstance(raw_text, str):
             return fail
         cleaned = re.sub(r"```(?:json)?", "", raw_text, flags=re.IGNORECASE).strip()
@@ -255,15 +265,20 @@ class ThreatResponderGraph:
         except Exception:
             return fail
         act = parsed.get("action") or parsed.get("decision") or parsed.get("classification") or ""
+        confidence_reported = True
         try:
-            conf = float(parsed.get("confidence", 0.5))
-        except (TypeError, ValueError):
+            conf = float(parsed["confidence"])
+            if not math.isfinite(conf):
+                raise ValueError("non-finite confidence")
+        except (KeyError, TypeError, ValueError):
             conf = 0.5
+            confidence_reported = False
         return {
             "action": adapter.normalize_action(str(act)),
             "confidence": min(1.0, max(0.0, conf)),
             "reasoning": str(parsed.get("reasoning", "")) or "No reasoning provided.",
             "parse_failed": False,
+            "confidence_reported": confidence_reported,
         }
 
     def _node_evaluate_threat(self, state: AgentState) -> Dict[str, Any]:
@@ -309,6 +324,22 @@ class ThreatResponderGraph:
             if guard_applied:
                 reasoning = "Policy guard: " + "; ".join(guard_reasons) + f" (LLM said {llm_raw_action})."
 
+            review_reasons = []
+            if self.require_agreement_review:
+                ctx = sig.context or {}
+                cset = ctx.get("conformal_set")
+                review = evaluate_agreement_review(
+                    final_action, llm_action=llm_raw_action, ml_class=ctx.get("ml_predicted_class", ""),
+                    conformal_set=cset if isinstance(cset, list) else [],
+                    conformal_singleton=ctx.get("conformal_singleton") is True,
+                    allowed_actions=adapter.allowed_actions,
+                    quarantine_action=adapter.fallback_action, ioc_hits=ctx.get("ioc_hits", 0),
+                    ioc_block_action=adapter.ioc_block_action,
+                )
+                final_action, review_reasons = review.action, review.reasons
+                if review.applied:
+                    reasoning = "Human review required: " + "; ".join(review_reasons) + "."
+
             wall = (perf_counter() - start_wall) * 1000
             cpu = (process_time() - start_cpu) * 1000
             return {
@@ -322,12 +353,18 @@ class ThreatResponderGraph:
                     "evaluation_mode": "ESCALATION_RAG_LLM",
                     "llm_raw_action": llm_raw_action,
                     "self_reported_confidence": conf,
+                    "llm_confidence_source": (
+                        "model_reported" if all(d["confidence_reported"] for d in winners)
+                        else "contains_default"
+                    ),
                     "vote_agreement": agreement,
                     "llm_samples": len(draws),
                     "parse_failed": parse_failed,
                     "abstain_reason": abstain_reason,
                     "policy_guard_applied": guard_applied,
                     "policy_guard_reasons": guard_reasons,
+                    "review_reasons": review_reasons,
+                    "review_policies": sig.context.get("review_policies", []),
                     "risk_score": risk,
                     "ml_entropy_bits": entropy,
                     "cpu_latency_ms": round(cpu, 2),
@@ -382,6 +419,7 @@ class ThreatResponderGraph:
             "uncertainty_metadata": {
                 "error": err,
                 "evaluation_mode": "fallback_handler",
+                "review_policies": sig.context.get("review_policies", []),
                 "hardware_device": self._get_device_name(),
             },
         }

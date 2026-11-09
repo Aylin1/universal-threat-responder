@@ -57,7 +57,7 @@ class RAGSpamAdapter(DomainAdapter):
         ioc_path: Optional[str] = DEFAULT_IOC_PATH,
         guard_config: Optional[GuardConfig] = None,
         k_history: int = 8,
-        k_patterns: int = 2,
+        k_patterns: int = 5,
         distance_metric: str = "L2",
         strict: bool = True,
         collection_name: Optional[str] = None,   # legacy alias for history_collection
@@ -71,6 +71,9 @@ class RAGSpamAdapter(DomainAdapter):
         self._domain_description = "Milvus-backed RAG + labelled-history adapter for email phishing/spam triage."
         self.guard_config = guard_config or GuardConfig()
         self.k_history, self.k_patterns = k_history, k_patterns
+        self.history_collection = collection_name or history_collection
+        self.pattern_collection = pattern_collection
+        self.ioc_index_path = ioc_path
         self.distance_metric = distance_metric.upper()
         self.strict = strict
         self.retrieval_errors = 0
@@ -86,7 +89,7 @@ class RAGSpamAdapter(DomainAdapter):
 
         conn = {"uri": milvus_uri}
         self.history_store = Milvus(embedding_function=self.embeddings,
-                                    collection_name=collection_name or history_collection,
+                                    collection_name=self.history_collection,
                                     connection_args=conn)
         self.pattern_store = Milvus(embedding_function=self.embeddings,
                                     collection_name=pattern_collection,
@@ -195,6 +198,18 @@ class RAGSpamAdapter(DomainAdapter):
             })
 
         relevant = [n for n in neighbors if n["sim"] >= MIN_RELEVANT_SIMILARITY]
+        patterns.sort(key=lambda p: -p["sim"])
+        policy_text = {p.split(":", 1)[0]: p for p in DEFAULT_POLICIES}
+        review_policies = []
+        seen_sops = set()
+        for pattern in patterns:
+            sop_id = pattern["sop_id"]
+            if not sop_id or sop_id in seen_sops:
+                continue
+            seen_sops.add(sop_id)
+            review_policies.append({**pattern, "policy": policy_text.get(sop_id, "")})
+            if len(review_policies) == 3:
+                break
         top_sims = [n["sim"] for n in neighbors] + [p["sim"] for p in patterns]
         allowed_ids = {p.split(":")[0] for p in DEFAULT_POLICIES}
         allowed_ids |= {p["sop_id"] for p in patterns if p["sop_id"]}
@@ -208,6 +223,7 @@ class RAGSpamAdapter(DomainAdapter):
             "ioc_host_hits": ioc_host_hits,
             "neighbors": neighbors,
             "pattern_matches": patterns,
+            "review_policies": review_policies,
             "nn_top_sim": neighbors[0]["sim"] if neighbors else 0.0,
             "nn_top_label": neighbors[0]["label"] if neighbors else "",
             "nn_relevant_count": len(relevant),

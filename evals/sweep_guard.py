@@ -3,7 +3,7 @@
 The eval CSV stores the LLM's raw verdict, the ML prediction and the retrieved neighbours, so the
 guard (a pure function) can be replayed over a grid of thresholds.
 
-    python -m evals.sweep_guard evals/live_audit_report_results_fastpath-enabled_*.csv --max-leak 0.02
+    python -m evals.sweep_guard evals/results/historical/live_audit_report_results_fastpath-disabled_20261102_222648_585601.csv --max-leak 0.02
 
 IMPORTANT: tune on one fold/seed and REPORT on another (`run_evals.py --fold 1`, re-run populate with
 the same --fold). Choosing thresholds on the very rows you then report is optimistic.
@@ -11,13 +11,39 @@ the same --fold). Choosing thresholds on the very rows you then report is optimi
 import argparse
 import itertools
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
 
-from src.guard import GuardConfig, evaluate_guard
+from src.guard import GuardConfig, evaluate_agreement_review, evaluate_guard
 
 ABSTAIN = "QUARANTINE"
+
+
+def replay_agreement_review(df: pd.DataFrame) -> pd.Series:
+    required = {"agent_action", "llm_raw_action", "ml_predicted_class",
+                "conformal_set", "conformal_singleton", "ioc_hits"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns for agreement review: {sorted(missing)}")
+    if df["llm_raw_action"].isna().any() or df["ml_predicted_class"].isna().any():
+        raise ValueError("Agreement replay requires ML and LLM predictions for every row; use a fast-path-disabled run")
+    if "route_taken" in df.columns and (df["route_taken"] != "ESCALATION_RAG_LLM").any():
+        raise ValueError("Agreement replay requires LLM-path results for every row")
+    actions = []
+    for _, row in df.iterrows():
+        raw_set = row["conformal_set"]
+        cset = raw_set.split("|") if isinstance(raw_set, str) and raw_set else []
+        singleton = str(row["conformal_singleton"]).strip().lower() in {"true", "1", "1.0"}
+        verdict = evaluate_agreement_review(
+            row["agent_action"], llm_action=row["llm_raw_action"], ml_class=row["ml_predicted_class"],
+            conformal_set=cset, conformal_singleton=singleton,
+            allowed_actions=("VALID", "SPAM", "PHISHING", "QUARANTINE"),
+            quarantine_action=ABSTAIN, ioc_hits=int(row["ioc_hits"]),
+        )
+        actions.append(verdict.action)
+    return pd.Series(actions, index=df.index)
 
 
 def _prep(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,10 +92,19 @@ def main():
     ap.add_argument("--max-leak", type=float, default=0.02,
                     help="max share of spam/phishing allowed to be auto-ALLOWED (default 2%%)")
     ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("--out", default="evals/guard_sweep.csv")
+    ap.add_argument("--out", default="evals/results/generated/guard_sweep.csv")
+    ap.add_argument("--agreement-review", action="store_true",
+                    help="replay the current agreement-review policy on a complete disabled run")
     a = ap.parse_args()
 
-    df = _prep(pd.read_csv(a.csv))
+    df = pd.read_csv(a.csv)
+    if a.agreement_review:
+        pred = replay_agreement_review(df)
+        print(f"Agreement-review counterfactual on {len(df)} historical rows (not a new model run):")
+        print({k: round(v, 4) for k, v in score(df["true_label"], pred).items()})
+        print("The prior LLM saw the ML prediction; this replay is not independent model agreement.")
+        return
+    df = _prep(df)
     if df.empty:
         raise SystemExit("No LLM-path rows with llm_raw_action in this CSV (fast path covered everything?).")
 
@@ -98,7 +133,9 @@ def main():
                      "nb_min_frac": nb_frac if nb_on else None, "nb_min_count": nb_n if nb_on else None, **s})
 
     res = pd.DataFrame(rows)
-    res.to_csv(a.out, index=False)
+    output = Path(a.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    res.to_csv(output, index=False)
     ok = res[res["leak_rate"] <= a.max_leak].sort_values(["e2e_acc", "leak_rate", "valid_quarantined_rate"],
                                                                  ascending=[False, True, True])
     print(f"\nTop {a.top} configs with leak_rate <= {a.max_leak:.0%} (by end-to-end accuracy):")

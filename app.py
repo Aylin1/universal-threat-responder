@@ -15,6 +15,7 @@ except ImportError:
     rapid_ocr = None
 
 from langchain_ollama import ChatOllama
+from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter
 from adapters.rag_spam_adapter import RAGSpamAdapter
 from src.core import ThreatResponderGraph, SecurityTools
 from src.domain_interface import ThreatSignal
@@ -28,6 +29,7 @@ st.markdown("Test your threat intelligence and classification engine interactive
 
 @st.cache_resource
 def load_threat_engine():
+    classifier = PhishFuzzerDatasetAdapter(file_path=cfg.dataset.file_path)
     adapter = RAGSpamAdapter(
         milvus_uri=cfg.vector_store.uri,
         collection_name=getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
@@ -42,9 +44,10 @@ def load_threat_engine():
         llm=llm,
         tools=tools,
         confidence_threshold=cfg.llm.confidence_threshold,
-        use_fast_path=cfg.conformal.use_fast_path
+        use_fast_path=False,
+        require_agreement_review=True,
     )
-    return adapter, graph
+    return adapter, graph, classifier
 
 def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
     """Multi-engine PDF text extractor with automatic OCR fallback for image/outlined PDFs."""
@@ -109,12 +112,12 @@ def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
     return ""
 
 with st.spinner("Initializing Milvus vector database and local LLM graph..."):
-    adapter, agent = load_threat_engine()
+    adapter, agent, classifier = load_threat_engine()
 
 # Sidebar Telemetry View
 st.sidebar.header("Engine Telemetry Configuration")
-st.sidebar.text(f"Fast-Path Enabled: {cfg.conformal.use_fast_path}")
-st.sidebar.text(f"Conformal Bounds: [{cfg.conformal.low_bound}, {cfg.conformal.high_bound}]")
+st.sidebar.text("Policy: ML + LLM agreement and conformal singleton")
+st.sidebar.text("Fast-Path Enabled: False")
 st.sidebar.text(f"Model: {cfg.llm.model_name}")
 
 email_text = ""
@@ -239,13 +242,16 @@ if analyze_requested:
                             **sample.get("metadata", {}),
                         },
                     )
+                    context.update(classifier.classify_text(sample["text"]))
+                    ml_class = context["ml_predicted_class"]
+                    ml_confidence = context["ml_probs"][ml_class]
 
                     signal = ThreatSignal(
                         signal_id=f"ST-{random.randint(100000, 999999)}",
                         domain="spam_phishing",
                         raw_payload=sample["text"],
-                        risk_score=context.get("max_risk_score", 0.50),
-                        confidence=0.85,
+                        risk_score=ml_confidence,
+                        confidence=ml_confidence,
                         context=context,
                     )
 
@@ -254,8 +260,10 @@ if analyze_requested:
                     results.append({
                         "Sample": sample["id"],
                         "Action": decision.action,
-                        "Confidence": decision.confidence,
-                        "Risk": context.get("max_risk_score", 0.0),
+                        "LLM confidence": decision.metadata.get("self_reported_confidence"),
+                        "LLM confidence source": decision.metadata.get("llm_confidence_source"),
+                        "ML VALID probability": context["ml_probs"].get("VALID"),
+                        "ML top probability": ml_confidence,
                         "Latency (ms)": decision.latency_ms,
                         "Decision": decision,
                         "Context": context,
@@ -265,22 +273,34 @@ if analyze_requested:
                     results.append({
                         "Sample": sample["id"],
                         "Action": "ERROR",
-                        "Confidence": 0.0,
-                        "Risk": 0.0,
-                        "Latency (ms)": 0.0,
+                        "LLM confidence": None,
+                        "LLM confidence source": None,
+                        "ML VALID probability": None,
+                        "ML top probability": None,
+                        "Latency (ms)": None,
                         "Error": str(error),
                     })
 
         st.subheader("📊 Batch Analysis Results")
+        st.caption("ML VALID probability is the classifier's estimate. LLM confidence is self-reported "
+                   "for its predicted class, not a calibrated probability; missing values use a default.")
 
         st.dataframe(
             [
                 {
                     "Sample": result["Sample"],
                     "Action": result["Action"],
-                    "Confidence": f'{result["Confidence"]:.2%}',
-                    "Risk": f'{result["Risk"]:.2f}',
-                    "Latency (ms)": f'{result["Latency (ms)"]:.2f}',
+                    "ML VALID probability": (f'{result["ML VALID probability"]:.2%}'
+                                             if result["ML VALID probability"] is not None else "Unavailable"),
+                    "LLM confidence (self-reported)": (
+                        f'{result["LLM confidence"]:.2%}' +
+                        (" (includes default)" if result["LLM confidence source"] == "contains_default" else "")
+                        if result["LLM confidence"] is not None else "Unavailable"
+                    ),
+                    "ML top probability": (f'{result["ML top probability"]:.2%}'
+                                           if result["ML top probability"] is not None else "Unavailable"),
+                    "Latency (ms)": (f'{result["Latency (ms)"]:.2f}'
+                                     if result["Latency (ms)"] is not None else "Unavailable"),
                 }
                 for result in results
             ],
@@ -298,21 +318,17 @@ if analyze_requested:
 
                 st.info(decision.reasoning)
                 st.write(f"**Audit ID:** `{decision.audit_id}`")
-                st.write(f"**High-Risk Matches:** `{context.get('high_risk_hits', 0)}`")
-                st.write(
-                    f"**SOP Associated With Maximum Risk:** "
-                    f"`{context.get('max_risk_sop', 'UNKNOWN')}`"
-                )
+                st.write(f"**ML prediction:** {context['ml_predicted_class']}")
+                st.write(f"**Conformal set:** {context['conformal_set']}")
+                st.write(f"**LLM prediction:** {decision.metadata.get('llm_raw_action', 'Unavailable')}")
+                st.write(f"**Threat-feed URL hits:** {context.get('ioc_hits', 0)}")
 
-                st.write("**Retrieved Threat Intelligence:**")
-                matches = context.get("retrieved_matches", [])
-                if matches:
-                    st.dataframe(matches, use_container_width=True)
+                st.write("**Top relevant policy patterns (up to 3):**")
+                policies = context.get("review_policies", [])
+                if policies:
+                    st.dataframe(policies, use_container_width=True)
                 else:
-                    st.write("No matching threat intelligence signatures.")
-
-                st.write("**Retrieved Policies:**")
-                st.write(context.get("retrieved_policies", []))
+                    st.warning("No policy patterns met the relevance threshold.")
 
                 st.write("**Decision Metadata:**")
                 st.json(decision.metadata)

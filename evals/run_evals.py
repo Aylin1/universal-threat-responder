@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import subprocess
 import sys
 from datetime import datetime
@@ -13,10 +14,12 @@ from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter
 from adapters.rag_spam_adapter import RAGSpamAdapter
 from config import cfg
 from evals.analyze_results import summarize, to_markdown
+from evals.run_metadata import build_run_metadata
 from evals.threat_evaluator import DetailedThreatEvaluator
 from src.config_access import cfg_get
 from src.core import SecurityTools, ThreatResponderGraph
 
+logger = logging.getLogger(__name__)
 MANIFEST_PATH = Path("./data/history_manifest.json")
 
 
@@ -40,12 +43,15 @@ def verify_history_index(loader: PhishFuzzerDatasetAdapter):
         raise SystemExit("The indexed email history was built from a DIFFERENT split (dataset/seed/fold changed). "
                          "Re-run scripts/populate_phishing_vectorstore.py with the same --dataset-path and --fold.")
     print(f"[ok] History index matches split ({manifest['n_docs']} labelled emails indexed).")
+    return manifest
 
 
 def run_evaluation():
     parser = argparse.ArgumentParser(description="Run Threat Responder Evaluation")
     parser.add_argument("--disable-fast-path", action="store_true")
     parser.add_argument("--enable-fast-path", action="store_true")
+    parser.add_argument("--legacy-policy", action="store_true",
+                        help="run the historical LLM/guard policy instead of mandatory agreement review")
     parser.add_argument("--alpha", type=float, help="conformal miscoverage level (default 0.05)")
     parser.add_argument("--fold", type=int, default=0, help="outer CV fold used as test split")
     parser.add_argument("--sample-fraction", type=float)
@@ -57,9 +63,11 @@ def run_evaluation():
     parser.add_argument("--low-bound", type=float)
     args = parser.parse_args()
 
+    if args.enable_fast_path and not args.legacy_policy:
+        parser.error("--enable-fast-path requires --legacy-policy; agreement review runs both models")
+    if args.enable_fast_path and args.disable_fast_path:
+        parser.error("choose either --enable-fast-path or --disable-fast-path")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    audit_log_path = Path(cfg.paths.audit_log_path)
-    cfg.paths.audit_log_path = str(audit_log_path.with_name(f"{audit_log_path.stem}_{run_id}{audit_log_path.suffix}"))
 
     if args.disable_fast_path:
         cfg.conformal.use_fast_path = False
@@ -78,7 +86,7 @@ def run_evaluation():
     print("\nBuilding dataset splits, fitting classifier and calibrating conformal router...")
     loader = PhishFuzzerDatasetAdapter(file_path=cfg.dataset.file_path, alpha=args.alpha, outer_fold=args.fold)
     loader.assert_no_leakage()
-    verify_history_index(loader)
+    history_manifest = verify_history_index(loader)
     leak = loader.leakage_report()
     print("Leakage report:", json.dumps(leak))
     print("Conformal check on held-out test split:", json.dumps(
@@ -87,18 +95,27 @@ def run_evaluation():
     print("  per-class coverage:", {k: round(v, 3) for k, v in loader.conformal_report["coverage_per_class"].items()})
 
     use_fast = bool(cfg_get("conformal", "use_fast_path", True))
+    mode = ("fastpath-enabled" if use_fast else "fastpath-disabled") if args.legacy_policy else "agreement-review"
+    stem = f"live_audit_report_results_{mode}_{run_id}"
+    run_dir = Path("evals") / "results" / "runs" / f"{mode}_{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=False)
     print(f"\n - Fast path enabled: {use_fast}\n - Conformal alpha:   {loader.alpha}\n"
           f" - Vector DB:         {cfg.vector_store.uri}\n - Dataset:           {cfg.dataset.file_path}\n")
 
     llm = ChatOllama(model=cfg.llm.model_name, temperature=cfg.llm.temperature, keep_alive=cfg.llm.keep_alive)
-    tools = SecurityTools(audit_log_path=cfg.paths.audit_log_path)
+    tools = SecurityTools(audit_log_path=str(run_dir / "audit.jsonl"))
     agent = ThreatResponderGraph(llm=llm, tools=tools, uncertainty_samples=args.llm_samples,
-                                 confidence_threshold=cfg.llm.confidence_threshold, use_fast_path=use_fast)
+                                 confidence_threshold=cfg.llm.confidence_threshold, use_fast_path=use_fast,
+                                 require_agreement_review=not args.legacy_policy)
     evaluator = DetailedThreatEvaluator(min_similarity_cutoff=cfg.vector_store.min_similarity_cutoff)
     adapter = RAGSpamAdapter(milvus_uri=cfg.vector_store.uri)
 
     test_items = loader.load_as_test_items(sample_fraction=cfg.dataset.sample_fraction, seed=cfg.dataset.seed)
     print(f"Running evaluation across {len(test_items)} samples...\n")
+    metadata = build_run_metadata(run_id=run_id, mode=mode, args=args, config=cfg, loader=loader,
+                                  adapter=adapter, history_manifest=history_manifest, sample_count=len(test_items))
+    metadata_path = run_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
     results = []
     for item in test_items:
@@ -121,6 +138,7 @@ def run_evaluation():
             meta = decision.metadata or {}
             route = meta.get("evaluation_mode", signal.context.get("evaluation_mode", "UNKNOWN"))
         except Exception as exc:
+            logger.exception("Graph execution failed for signal %s", signal.signal_id)
             graph_ms = float("nan")
             action, reasoning, confidence, route = "QUARANTINE", f"Graph execution failed: {exc}", 0.0, "FALLBACK"
 
@@ -135,12 +153,16 @@ def run_evaluation():
             "llm_raw_action": meta.get("llm_raw_action"),
             "route_taken": route,
             "agent_confidence": confidence,
+            "llm_confidence": meta.get("self_reported_confidence"),
+            "llm_confidence_source": meta.get("llm_confidence_source"),
             "label_match": action == true_label,
             "is_quarantined": action == "QUARANTINE",
             "abstained": bool(meta.get("abstain_reason")),
             "parse_failed": bool(meta.get("parse_failed", False)),
             "guard_applied": bool(meta.get("policy_guard_applied", False)),
             "guard_reasons": " | ".join(meta.get("policy_guard_reasons", [])),
+            "review_reasons": " | ".join(meta.get("review_reasons", [])),
+            "review_policies_json": json.dumps(meta.get("review_policies", [])),
             "ml_predicted_class": ctx.get("ml_predicted_class"),
             "ml_top_prob": tel["ml_uncertainty"]["ml_top_prob"],
             "ml_prob_valid": probs.get("VALID"), "ml_prob_spam": probs.get("SPAM"),
@@ -166,14 +188,15 @@ def run_evaluation():
         })
 
     df = pd.DataFrame(results)
-    mode = "fastpath-enabled" if use_fast else "fastpath-disabled"
-    out_csv = Path("evals") / f"live_audit_report_results_{mode}_{run_id}.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_csv = run_dir / f"{stem}.csv"
     df.to_csv(out_csv, index=False)
 
     summary = summarize(df)
     md = to_markdown(summary, title=f"Evaluation {run_id} ({mode}, alpha={loader.alpha}, fold={args.fold})")
-    md += ("\n## Latency (ms, per email)\n\n"
+    md += ("\n## Run metadata\n\n"
+           "See [metadata.json](metadata.json) for model parameters, split and data fingerprints, "
+           "retrieval and guard settings, and package versions. The LLM model digest is not captured.\n"
+           "\n## Latency (ms, per email)\n\n"
            f"- retrieval (embedding + Milvus): mean {df['retrieval_ms'].mean():.1f}\n"
            f"- graph (LLM or bypass node only): mean {df['graph_ms'].mean():.1f}\n"
            f"- end-to-end: mean {df['end_to_end_ms'].mean():.1f}, p95 {df['end_to_end_ms'].quantile(0.95):.1f}\n"
@@ -181,7 +204,7 @@ def run_evaluation():
     out_md = out_csv.with_suffix(".md")
     out_md.write_text(md, encoding="utf-8")
     print(md)
-    print(f"\nSaved telemetry to `{out_csv}` and report to `{out_md}`")
+    print(f"\nSaved telemetry to `{out_csv}`, report to `{out_md}`, and run metadata to `{metadata_path}`")
 
 
 if __name__ == "__main__":

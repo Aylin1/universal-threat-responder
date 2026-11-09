@@ -12,10 +12,10 @@
 
 The system accepts heterogeneous threat signals, normalizes them into a common representation, retrieves relevant threat intelligence from a Milvus vector database, and processes the enriched signal through a stateful LangGraph decision workflow.
 
-It supports both:
-
-- **high-confidence fast-path decisions**, and
-- **full RAG + LLM escalation** for samples requiring deeper contextual reasoning.
+The default evaluates both the ML model and the LLM on every input. An agreed conformal
+singleton may be classified automatically, including VALID when the policy guard permits
+it. Disagreements and non-singletons are quarantined for human review. The previous
+fast-path policy remains available for historical comparison.
 
 The project also includes an evaluation pipeline for measuring **classification performance, uncertainty, retrieval similarity, calibration, and routing behaviour**.
 
@@ -66,99 +66,39 @@ Evaluation
 
 ## ✨ Key Features
 
-| Feature                         | Description                                                                    | Technology                           |
-| :------------------------------ | :----------------------------------------------------------------------------- | :----------------------------------- |
-| **Agentic Threat Triage**       | Stateful threat-analysis workflow producing structured decisions               | LangGraph                            |
-| **Local LLM Reasoning**         | Runs the reasoning layer locally without requiring a hosted LLM API            | Ollama / Llama 3                     |
-| **Milvus RAG**                  | Retrieves relevant threat indicators, historical patterns, and SOP context     | Milvus + BGE embeddings              |
-| **Conformal Fast Path**         | Bypasses the expensive LLM path for sufficiently confident predictions         | Conformal risk routing               |
-| **Live Threat Intelligence**    | Synchronizes current phishing and malicious-URL intelligence before evaluation | OpenPhish, Abuse.ch URLhaus          |
-| **PDF & OCR Processing**        | Extracts text from native and scanned PDF documents                            | PyMuPDF, pdfplumber, pypdf, RapidOCR |
-| **Domain Adapter Architecture** | Separates domain-specific data loading from the core decision graph            | `DomainAdapter`                      |
-| **Zero-Leakage Evaluation**     | Uses grouped stratification to reduce template memorization                    | StratifiedGroupKFold                 |
-| **Telemetry & Audit Logging**   | Records prediction, uncertainty, retrieval, routing, and operational metrics   | CSV / logs                           |
-| **Interactive Dashboard**       | Allows interactive analysis of text, files, and PDFs                           | Streamlit                            |
+| Feature                          | Description                                                                    | Technology                           |
+| :------------------------------- | :----------------------------------------------------------------------------- | :----------------------------------- |
+| **Agentic Threat Triage**        | Stateful threat-analysis workflow producing structured decisions               | LangGraph                            |
+| **Local LLM Reasoning**          | Runs the reasoning layer locally without requiring a hosted LLM API            | Ollama / Llama 3                     |
+| **Milvus RAG**                   | Retrieves relevant threat indicators, historical patterns, and SOP context     | Milvus + BGE embeddings              |
+| **Conformal & Agreement Review** | Quarantines uncertain predictions, model disagreements and guard vetoes        | Split conformal + policy guard       |
+| **Live Threat Intelligence**     | Synchronizes current phishing and malicious-URL intelligence before evaluation | OpenPhish, Abuse.ch URLhaus          |
+| **PDF & OCR Processing**         | Extracts text from native and scanned PDF documents                            | PyMuPDF, pdfplumber, pypdf, RapidOCR |
+| **Domain Adapter Architecture**  | Separates domain-specific data loading from the core decision graph            | `DomainAdapter`                      |
+| **Leakage-Aware Evaluation**     | Uses grouped stratification and checks for exact duplicates                    | StratifiedGroupKFold                 |
+| **Telemetry & Audit Logging**    | Records prediction, uncertainty, retrieval, routing, and operational metrics   | CSV / logs                           |
+| **Interactive Dashboard**        | Allows interactive analysis of text, files, and PDFs                           | Streamlit                            |
 
 ---
 
 # 🏗️ System Architecture
 
 ```text
-                         ┌──────────────────────────────┐
-                         │   Live Threat Intelligence   │
-                         │                              │
-                         │ OpenPhish / Abuse.ch URLhaus│
-                         └──────────────┬───────────────┘
-                                        │
-                                        ▼
-┌──────────────────────┐       ┌────────────────────────┐
-│ Raw Threat Input     │       │      Milvus RAG        │
-│                      │       │                        │
-│ • Text               │       │ • Threat indicators   │
-│ • Text files         │       │ • Historical patterns  │
-│ • PDF documents      │       │ • SOP context          │
-└──────────┬───────────┘       └────────────┬───────────┘
-           │                                │
-           ▼                                │
-┌──────────────────────┐                    │
-│ Document Extraction  │                    │
-│                      │                    │
-│ PyMuPDF              │                    │
-│ pdfplumber           │                    │
-│ pypdf                │                    │
-│ RapidOCR             │                    │
-└──────────┬───────────┘                    │
-           │                                │
-           └──────────────┬─────────────────┘
-                          ▼
-                 ┌──────────────────┐
-                 │   ThreatSignal   │
-                 │ Normalized input │
-                 └────────┬─────────┘
-                          │
-                          ▼
-                 ┌──────────────────┐
-                 │ Conformal Router │
-                 └───────┬─────┬────┘
-                         │     │
-                confident│     │uncertain
-                         │     │
-                         ▼     ▼
-                    ┌──────┐ ┌──────────────┐
-                    │Fast  │ │  Milvus RAG  │
-                    │Path  │ │  Retrieval   │
-                    └──┬───┘ └──────┬───────┘
-                       │             │
-                       │             ▼
-                       │      ┌──────────────┐
-                       │      │  Local LLM   │
-                       │      │  Ollama      │
-                       │      └──────┬───────┘
-                       │             │
-                       └──────┬──────┘
-                              ▼
-                    ┌────────────────────┐
-                    │ ThreatResponderGraph│
-                    │      LangGraph      │
-                    └─────────┬──────────┘
-                              │
-                              ▼
-                    ┌────────────────────┐
-                    │   DecisionOutput    │
-                    │                    │
-                    │ PHISHING / SPAM    │
-                    │ VALID / QUARANTINE │
-                    └─────────┬──────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-             ┌──────────────┐    ┌───────────────┐
-             │ Audit Logs   │    │ Evaluation    │
-             │              │    │ Telemetry     │
-             └──────────────┘    └───────────────┘
+Email / document
+  -> calibrated ML prediction + conformal set
+  -> Milvus retrieval + local LLM classification
+  -> agreement review
+       -> matching singleton and no guard veto: VALID, SPAM or PHISHING
+       -> disagreement / non-singleton / guard veto / failure: QUARANTINE
+  -> audit log + up to 3 relevant retrieved policy patterns
 ```
 
-The current implementation normalizes inputs into a `ThreatSignal`, enriches them through the RAG layer, processes them with `ThreatResponderGraph`, and records the resulting decision and evaluation telemetry.
+VALID decisions are automatically allowed only on agreement with a VALID singleton and
+when the policy guard does not veto them. This does not guarantee zero leaks.
+QUARANTINE is a conservative status, not a fully implemented human-review queue: the prototype records an
+audit entry and displays the retrieved patterns, but does not manage analyst approvals.
+Fewer than three patterns may be shown if retrieval finds fewer relevant matches. The LLM
+prompt includes the ML prediction, so model agreement is not statistically independent.
 
 ---
 
@@ -175,6 +115,7 @@ universal-threat-responder/
 │   └── spam/                            # Evaluation benchmark datasets
 ├── evals/
 │   ├── __init__.py
+│   ├── results/                         # Historical, experimental and new run outputs
 │   ├── run_evals.py                     # Main evaluation runner with threat-intel sync
 │   └── threat_evaluator.py              # Uncertainty & evaluation metrics
 ├── scripts/
@@ -212,20 +153,40 @@ The Streamlit prototyping dashboard (`app.py`) allows you to analyze threat sign
   <img src="example_screenshots/example_response_page_2.png" width="48%" alt="Dashboard Preview Page 2">
 </p>
 
-### Sample PDF Triage Execution
-
-When processing an uploaded threat report or email PDF (`2.pdf`), the multi-engine parser and OCR pipeline execute sequentially:
-
-- **OCR Extraction Pipeline**: If no digital text streams are found, the engine initiates optical character recognition.
-- **Decision Action**: **QUARANTINE**
-- **Confidence & Max Risk Score**: `0.96`
-- **Execution Latency**: `0.07 ms`
+For scanned PDFs, the extraction pipeline falls back to OCR when digital text is unavailable.
 
 ---
 
 ## Benchmark & Telemetry Results
 
-Evaluated on 3,960 PhishFuzzer samples, enabling fast-path routing raised accuracy on resolved rows from 85.83% to 90.02% (macro F1 0.789 → 0.884) and cut the quarantine rate from 45.66% to 33.74%.
+The historical 2026-11-02 runs used 3,960 PhishFuzzer samples each. With fast-path enabled,
+coverage was 94.4%, resolved accuracy 93.0%, and leak rate 2.8%. With it disabled,
+coverage was 83.7%, resolved accuracy 94.0%, and leak rate 1.3%. These use the old policy,
+not the current agreement-review policy.
+
+On the disabled run, the ML-only conformal baseline decided 87.8% of samples with 94.7%
+accuracy on those decisions. This is a historical dataset-specific result, not a guarantee.
+Replaying the agreement policy on those historical outputs yields 75.8% coverage, 97.1%
+resolved accuracy and a 0.6% leak rate; it is a counterfactual, not a new end-to-end run.
+
+The 2026-11-09 agreement-review run (`20261109_172140_227716`, 3,960 samples,
+fold 0, alpha 0.05) evaluated both ML and the LLM. All samples took the RAG/LLM
+route; only agreeing, unambiguous predictions were decided automatically.
+
+| System | Coverage | Resolved accuracy | End-to-end accuracy | Leak rate | False-block rate |
+|---|---:|---:|---:|---:|---:|
+| ML only | 100.0% | 90.6% | 90.6% | 4.6% | 13.4% |
+| ML + conformal | 87.8% | 94.7% | 83.1% | 2.2% | 6.9% |
+| Agreement review + RAG/LLM | 75.8% | 97.0% [96.4, 97.6] | 73.6% [72.2, 75.0] | 0.6% | 3.8% |
+
+The full system had higher accuracy among decided samples, but quarantined more
+samples, lowering end-to-end accuracy. Results are specific to this dataset, split,
+model, and configuration.
+
+In short, 97.0% resolved accuracy applies only to the 75.8% of samples handled
+without quarantine; end-to-end accuracy was 73.6% when quarantines count as unresolved.
+Reporting both outcomes, along with the run settings and data provenance, makes the
+trade-off visible and helps prevent selective interpretation of benchmark results.
 
 See **[benchmark_results.md](benchmark_results.md)** for the full performance summary, confusion matrices, telemetry, and data provenance.
 
@@ -270,10 +231,10 @@ See **[benchmark_results.md](benchmark_results.md)** for the full performance su
 
 - Python 3.10+
 - [Ollama](https://ollama.com/) installed and running locally
-- Llama 3.2
+- Llama 3 (the default in `config.py`)
 
 ```bash
-ollama pull llama3.2
+ollama pull llama3
 ```
 
 Keep Ollama running while using the evaluator or dashboard. If Ollama is not
@@ -292,10 +253,16 @@ another terminal.
 git clone https://github.com/Aylin1/universal-threat-responder.git
 cd universal-threat-responder
 
-# Linux / macOS / Git Bash
+# Linux / macOS
 python3 -m venv .venv
 source .venv/bin/activate
 
+# Windows Git Bash
+python -m venv .venv
+source .venv/Scripts/activate
+```
+
+```powershell
 # Windows PowerShell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -309,33 +276,75 @@ pip install -r requirements.txt
 
 ### Run Tests
 
+After activating the virtual environment and installing dependencies:
+
 ```bash
 python -m pytest
 ```
 
-### 1. Run Evaluation — Fast-Path Enabled
+Unit tests do not require Ollama or a populated vector store.
+
+### 1. Run Evaluation — Agreement Review (Default)
+
+Ensure Ollama is running (`ollama serve` in a separate terminal if needed), then
+populate the matching history index:
+
+```bash
+python scripts/populate_phishing_vectorstore.py
+```
 
 ```bash
 python -m evals.run_evals
 ```
 
-### 2. Run Evaluation — Full LLM/RAG Path
+### 2. Run Historical Policy Comparisons
 
 ```bash
-python -m evals.run_evals --disable-fast-path
+python -m evals.run_evals --legacy-policy --enable-fast-path
+python -m evals.run_evals --legacy-policy --disable-fast-path
 ```
 
-Both commands evaluate the PhishFuzzer dataset and write a timestamped telemetry report to:
+Each new evaluation creates a separate, git-ignored run folder:
 
 ```text
-evals/live_audit_report_results_<fastpath-enabled|fastpath-disabled>_<run_id>.csv
+evals/results/runs/<mode>_<run_id>/
+├── live_audit_report_results_<mode>_<run_id>.csv
+├── live_audit_report_results_<mode>_<run_id>.md
+├── metadata.json
+└── audit.jsonl
 ```
 
-After running one or both modes, refresh the Performance Summary in [benchmark_results.md](benchmark_results.md) from the latest report of each mode:
+The CSV records `ml_prob_valid`, the LLM's self-reported `llm_confidence`, and
+`llm_confidence_source`. The latter flags when a missing or invalid confidence was
+replaced by the parser's default. LLM confidence describes its predicted class, not
+necessarily VALID, and is not a calibrated probability. Multiple draws report the
+mean confidence of the winning votes. Values are blank if no LLM ran.
+
+The metadata records the actual fitted classifier and vectorizer parameters, conformal
+calibration, LLM settings, dataset and IOC snapshot hashes, split, retrieval/guard
+settings and package versions. The Ollama model digest is not captured, so the model
+tag alone does not establish an immutable model version. Existing reports are in
+`evals/results/historical/`, and experimental results are in `evals/results/experiments/`;
+unavailable historical parameters are not inferred.
+Run files and audit logs can contain sensitive evaluation information; inspect them
+before sharing or committing them.
+
+After running evaluations, refresh [benchmark_results.md](benchmark_results.md) from the latest report of each mode:
 
 ```bash
 python -m scripts.update_readme_results
 ```
+
+Replay the agreement policy on a complete historical disabled run without calling the LLM:
+
+```bash
+python -m evals.sweep_guard evals/results/historical/live_audit_report_results_fastpath-disabled_20261102_222648_585601.csv --agreement-review
+```
+
+The legacy guard sweep tunes a veto on LLM VALID decisions; its results do not directly
+tune the agreement policy, which also quarantines disagreements and non-singletons.
+Guard thresholds remain defaults and should be selected on development data and validated
+on a separate held-out split before use.
 
 ### 3. Launch the Interactive Dashboard
 

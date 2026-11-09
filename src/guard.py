@@ -42,6 +42,28 @@ class GuardVerdict:
     reasons: List[str] = field(default_factory=list)
 
 
+def evaluate_agreement_review(
+    action: str, *, llm_action: str, ml_class: str, conformal_set: Sequence[str],
+    conformal_singleton: bool, allowed_actions: Sequence[str],
+    quarantine_action: str, ioc_hits: int = 0, ioc_block_action: str = "PHISHING",
+) -> GuardVerdict:
+    """Keep automatic decisions only for agreeing, unambiguous predictions."""
+    reasons: List[str] = []
+    if not conformal_singleton or len(conformal_set) != 1:
+        reasons.append("conformal prediction is not a singleton")
+    elif conformal_set[0] != ml_class:
+        reasons.append("conformal singleton differs from the ML top class")
+    if not ml_class or ml_class not in allowed_actions or ml_class == quarantine_action:
+        reasons.append("ML prediction is missing or invalid")
+    elif ml_class != llm_action:
+        reasons.append(f"ML ({ml_class}) and LLM ({llm_action}) disagree")
+    if ioc_hits and action != ioc_block_action:
+        reasons.append("exact threat-feed match requires review")
+    if reasons:
+        return GuardVerdict(action=quarantine_action, applied=True, reasons=reasons)
+    return GuardVerdict(action=action)
+
+
 def evaluate_guard(
     llm_action: str,
     *,
