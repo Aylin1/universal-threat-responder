@@ -25,7 +25,7 @@ from config import cfg
 st.set_page_config(page_title="Universal Threat Responder", page_icon="🛡️", layout="wide")
 
 st.header("🛡️ Universal Threat Responder: Rapid Prototyping Dashboard")
-st.markdown("Test your threat intelligence and classification engine interactively with raw text, uploaded PDF documents, or text files.")
+st.markdown("Test your threat intelligence and classification engine interactively with raw text, uploaded PDF or PNG documents, or text files.")
 
 @st.cache_resource
 def load_threat_engine():
@@ -111,6 +111,22 @@ def extract_pdf_text_diagnostic(file_bytes: bytes) -> str:
 
     return ""
 
+def extract_png_text_diagnostic(file_bytes: bytes) -> str:
+    if rapid_ocr is None:
+        st.warning("⚠️ OCR engine not installed. Run `pip install rapidocr-onnxruntime` to process PNG images.")
+        return ""
+    try:
+        result, _ = rapid_ocr(file_bytes)
+        text = "\n".join(line[1] for line in result).strip() if result else ""
+        if text:
+            st.success("✅ OCR successfully extracted text from the PNG image!")
+        else:
+            st.error("❌ OCR failed to detect text in the PNG image.")
+        return text
+    except Exception as error:
+        st.error(f"❌ PNG OCR Extraction Error: {error}")
+        return ""
+
 with st.spinner("Initializing Milvus vector database and local LLM graph..."):
     adapter, agent, classifier = load_threat_engine()
 
@@ -126,7 +142,7 @@ samples = []
 # Input Navigation Tabs
 input_tab1, input_tab2, input_tab3 = st.tabs([
     "📝 Text Paste", 
-    "📄 PDF Document Upload", 
+    "📄 PDF / PNG Document Upload",
     "📊 JSON / CSV / Text / HTML Upload"
 ])
 
@@ -145,26 +161,30 @@ with input_tab1:
         }]
 
 with input_tab2:
-    uploaded_pdf = st.file_uploader(
-        "Upload threat report or email PDF",
-        type=["pdf"],
+    uploaded_document = st.file_uploader(
+        "Upload threat report or email PDF or PNG",
+        type=["pdf", "png"],
         key="pdf_uploader",
     )
 
-    if uploaded_pdf is not None:
-        extracted_text = extract_pdf_text_diagnostic(uploaded_pdf.getvalue())
+    if uploaded_document is not None:
+        is_png = uploaded_document.name.lower().endswith(".png")
+        extracted_text = (
+            extract_png_text_diagnostic(uploaded_document.getvalue())
+            if is_png else extract_pdf_text_diagnostic(uploaded_document.getvalue())
+        )
 
         if extracted_text:
             samples = [{
-                "id": uploaded_pdf.name,
+                "id": uploaded_document.name,
                 "text": extracted_text,
                 "metadata": {
-                    "source": "pdf_upload",
-                    "filename": uploaded_pdf.name,
+                    "source": "png_upload" if is_png else "pdf_upload",
+                    "filename": uploaded_document.name,
                 },
             }]
         else:
-            st.error("⚠️ Could not extract text from the PDF.")
+            st.error(f"⚠️ Could not extract text from the {'PNG' if is_png else 'PDF'}.")
 
 with input_tab3:
     uploaded_batch = st.file_uploader(
@@ -214,8 +234,8 @@ if samples:
 submitted = st.button("🚀 Analyze Threat Signal(s)", type="primary")
 
 uploaded_bytes = None
-if uploaded_pdf is not None:
-    uploaded_bytes = uploaded_pdf.getvalue()
+if uploaded_document is not None:
+    uploaded_bytes = uploaded_document.getvalue()
 elif uploaded_batch is not None:
     uploaded_bytes = uploaded_batch.getvalue()
 

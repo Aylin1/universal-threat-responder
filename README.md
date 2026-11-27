@@ -73,7 +73,7 @@ Evaluation
 | **Milvus RAG**                   | Retrieves relevant threat indicators, historical patterns, and SOP context     | Milvus + BGE embeddings              |
 | **Conformal & Agreement Review** | Quarantines uncertain predictions, model disagreements and guard vetoes        | Split conformal + policy guard       |
 | **Live Threat Intelligence**     | Synchronizes current phishing and malicious-URL intelligence before evaluation | OpenPhish, Abuse.ch URLhaus          |
-| **PDF & OCR Processing**         | Extracts text from native and scanned PDF documents                            | PyMuPDF, pdfplumber, pypdf, RapidOCR |
+| **PDF & OCR Processing**         | Extracts text from native and scanned PDF documents and PNG images             | PyMuPDF, pdfplumber, pypdf, RapidOCR |
 | **Domain Adapter Architecture**  | Separates domain-specific data loading from the core decision graph            | `DomainAdapter`                      |
 | **Leakage-Aware Evaluation**     | Uses grouped stratification and checks for exact duplicates                    | StratifiedGroupKFold                 |
 | **Telemetry & Audit Logging**    | Records prediction, uncertainty, retrieval, routing, and operational metrics   | CSV / logs                           |
@@ -144,7 +144,7 @@ universal-threat-responder/
 
 ## Interactive Dashboard & Execution Example
 
-The Streamlit prototyping dashboard (`app.py`) allows you to analyze threat signals interactively using raw text, text files, HTML, or uploaded PDF documents.
+The Streamlit prototyping dashboard (`app.py`) allows you to analyze threat signals interactively using raw text, text files, HTML, or uploaded PDF and PNG documents.
 
 ### Dashboard UI Preview
 
@@ -153,7 +153,7 @@ The Streamlit prototyping dashboard (`app.py`) allows you to analyze threat sign
   <img src="example_screenshots/example_response_page_2.png" width="48%" alt="Dashboard Preview Page 2">
 </p>
 
-For scanned PDFs, the extraction pipeline falls back to OCR when digital text is unavailable.
+For scanned PDFs, the extraction pipeline falls back to OCR when digital text is unavailable. PNG uploads use OCR to extract text; non-text visual details are not analyzed.
 
 ---
 
