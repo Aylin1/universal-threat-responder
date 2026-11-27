@@ -4,8 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter, extract_structural_features
+from adapters.phishfuzzer_loader import (
+    PhishFuzzerDatasetAdapter, extract_structural_features, load_classifier, save_classifier,
+)
 from config import AppConfig
 from evals.run_metadata import build_run_metadata
 from src.guard import GuardConfig
@@ -91,6 +94,34 @@ def test_classify_text_matches_training_features(tmp_path):
     expected = a.ml_classifier.predict_proba(a._featurize(a.test_df.iloc[[0]]))[0]
     assert np.allclose(list(result["ml_probs"].values()), expected)
     assert result["conformal_set"] == a.router.predict_one(expected).prediction_set
+
+
+def test_saved_classifier_reuses_preprocessing_and_calibration_without_dataset(tmp_path, monkeypatch):
+    p = tmp_path / "d.json"
+    _make_dataset(p)
+    trained = PhishFuzzerDatasetAdapter(file_path=str(p))
+    text = "Subject: account security\n\nPlease verify your login."
+    expected = trained.classify_text(text)
+    artifact = tmp_path / "classifier.joblib"
+    save_classifier(trained, str(artifact))
+    p.unlink()
+    monkeypatch.setattr(PhishFuzzerDatasetAdapter, "_fit_models",
+                        lambda *args: pytest.fail("Loading must not train"))
+    loaded = load_classifier(str(artifact))
+    assert loaded.classify_text(text) == expected
+
+
+def test_saved_classifier_reports_missing_or_incompatible_artifact(tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError, match="scripts.build_classifier"):
+        load_classifier(str(tmp_path / "missing.joblib"))
+    p = tmp_path / "d.json"
+    _make_dataset(p)
+    trained = PhishFuzzerDatasetAdapter(file_path=str(p))
+    artifact = tmp_path / "classifier.joblib"
+    save_classifier(trained, str(artifact))
+    monkeypatch.setattr("adapters.phishfuzzer_loader.version", lambda package: "different")
+    with pytest.raises(RuntimeError, match="Saved classifier requires scikit-learn"):
+        load_classifier(str(artifact))
 
 
 def test_run_metadata_records_actual_trained_parameters(tmp_path):

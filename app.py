@@ -15,11 +15,11 @@ except ImportError:
     rapid_ocr = None
 
 from langchain_ollama import ChatOllama
-from adapters.phishfuzzer_loader import PhishFuzzerDatasetAdapter
+from adapters.phishfuzzer_loader import load_classifier
 from adapters.rag_spam_adapter import RAGSpamAdapter
 from src.core import ThreatResponderGraph, SecurityTools
 from src.domain_interface import ThreatSignal
-from src.input_parsers import parse_csv_samples, parse_json_samples
+from src.input_parsers import parse_csv_samples, parse_html_text, parse_json_samples
 from config import cfg
 
 st.set_page_config(page_title="Universal Threat Responder", page_icon="🛡️", layout="wide")
@@ -29,7 +29,7 @@ st.markdown("Test your threat intelligence and classification engine interactive
 
 @st.cache_resource
 def load_threat_engine():
-    classifier = PhishFuzzerDatasetAdapter(file_path=cfg.dataset.file_path)
+    classifier = load_classifier(cfg.dataset.classifier_path)
     adapter = RAGSpamAdapter(
         milvus_uri=cfg.vector_store.uri,
         collection_name=getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
@@ -127,7 +127,7 @@ samples = []
 input_tab1, input_tab2, input_tab3 = st.tabs([
     "📝 Text Paste", 
     "📄 PDF Document Upload", 
-    "📊 JSON / CSV / Text Batch Upload"
+    "📊 JSON / CSV / Text / HTML Upload"
 ])
 
 with input_tab1:
@@ -168,8 +168,8 @@ with input_tab2:
 
 with input_tab3:
     uploaded_batch = st.file_uploader(
-        "Upload JSON, CSV, or TXT file",
-        type=["json", "csv", "txt"],
+        "Upload JSON, CSV, TXT, or HTML file",
+        type=["json", "csv", "txt", "html", "htm"],
         key="batch_uploader",
     )
 
@@ -183,12 +183,17 @@ with input_tab3:
             elif file_type == "csv":
                 samples = parse_csv_samples(raw_bytes)
             else:
-                text = raw_bytes.decode("utf-8-sig", errors="ignore").strip()
+                if file_type in ("html", "htm"):
+                    text = parse_html_text(raw_bytes)
+                    source = "html_upload"
+                else:
+                    text = raw_bytes.decode("utf-8-sig", errors="ignore").strip()
+                    source = "text_upload"
                 samples = [{
                     "id": uploaded_batch.name,
                     "text": text,
                     "metadata": {
-                        "source": "text_upload",
+                        "source": source,
                         "filename": uploaded_batch.name,
                     },
                 }] if text else []

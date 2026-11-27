@@ -42,6 +42,7 @@ class LLMConfig:
 @dataclass
 class DatasetConfig:
     file_path: str = "data/spam/PhishFuzzer_emails_entity_rephrased_v1.json"
+    classifier_path: str = "models/phishfuzzer_classifier.joblib"
     sample_fraction: float = 1.0
     seed: int = 42
     tfidf_max_features: int = 2000

@@ -3,9 +3,11 @@ import json
 import os
 import re
 import warnings
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+import joblib
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, hstack
@@ -155,7 +157,96 @@ def get_class_id(label_str: str) -> int:
     return 0
 
 
-class PhishFuzzerDatasetAdapter:
+class PhishFuzzerClassifier:
+    """Inference components shared by the dataset loader and saved models."""
+
+    def __init__(self, vectorizer, ml_classifier, router, classes):
+        self.vectorizer = vectorizer
+        self.ml_classifier = ml_classifier
+        self.router = router
+        self.classes = list(classes)
+
+    def _featurize(self, frame: pd.DataFrame):
+        tfidf = self.vectorizer.transform(frame['full_text'])
+        struct = extract_structural_features(frame)
+        return hstack([tfidf, csr_matrix(struct)]).tocsr()
+
+    def classify_text(self, text: str) -> Dict[str, Any]:
+        """Classify a new email using the same subject/body and structural features as training."""
+        if self.router is None or self.ml_classifier is None or self.vectorizer is None:
+            raise RuntimeError("Models not fitted (fit_models=False)")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Email text must not be empty")
+        fields = {"Subject": "", "Body": text, "Sender": "", "Url": "", "File": ""}
+        header, separator, body = text.partition("\n\n")
+        names = {"subject": "Subject", "sender": "Sender", "from": "Sender",
+                 "links": "Url", "url": "Url", "attachments": "File", "file": "File"}
+        parsed = {}
+        for line in header.splitlines():
+            name, colon, value = line.partition(":")
+            if not colon or name.strip().lower() not in names:
+                parsed = {}
+                break
+            parsed[names[name.strip().lower()]] = value.strip()
+        if separator and parsed:
+            fields.update(parsed)
+            fields["Body"] = re.sub(r"^Body:\s*\n?", "", body, count=1, flags=re.IGNORECASE)
+        frame = pd.DataFrame([fields])
+        frame["full_text"] = frame["Subject"] + "\n" + frame["Body"]
+        probs = self.ml_classifier.predict_proba(self._featurize(frame))[0]
+        decision = self.router.predict_one(probs)
+        return {
+            "ml_predicted_class": self.classes[int(np.argmax(probs))],
+            "ml_probs": {c: float(p) for c, p in zip(self.classes, probs)},
+            "conformal_set": list(decision.prediction_set),
+            "conformal_singleton": decision.is_singleton,
+        }
+
+
+def save_classifier(classifier: PhishFuzzerClassifier, path: str) -> None:
+    if classifier.vectorizer is None or classifier.ml_classifier is None or classifier.router is None:
+        raise ValueError("Cannot save an unfitted classifier")
+    packages = ["scikit-learn"]
+    if HAS_XGBOOST:
+        packages.append("xgboost")
+    bundle = {
+        "format_version": 1,
+        "versions": {package: version(package) for package in packages},
+        "vectorizer": classifier.vectorizer,
+        "classifier": classifier.ml_classifier,
+        "router": classifier.router,
+        "classes": classifier.classes,
+    }
+    joblib.dump(bundle, path, compress=3)
+
+
+def load_classifier(path: str) -> PhishFuzzerClassifier:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Saved classifier not found at {path}. Run python -m scripts.build_classifier first."
+        )
+    # Joblib artifacts must only be loaded from trusted sources.
+    bundle = joblib.load(path)
+    if not isinstance(bundle, dict) or bundle.get("format_version") != 1:
+        raise ValueError(f"Unsupported classifier artifact: {path}")
+    for package, expected in bundle["versions"].items():
+        try:
+            installed = version(package)
+        except PackageNotFoundError as error:
+            raise RuntimeError(f"Saved classifier requires {package}=={expected}") from error
+        if installed != expected:
+            raise RuntimeError(
+                f"Saved classifier requires {package}=={expected}; found {installed}. "
+                "Install the matching version or rebuild the artifact."
+            )
+    if bundle["classes"] != CLASSES:
+        raise ValueError(f"Unexpected classifier classes in {path}")
+    return PhishFuzzerClassifier(
+        bundle["vectorizer"], bundle["classifier"], bundle["router"], bundle["classes"]
+    )
+
+
+class PhishFuzzerDatasetAdapter(PhishFuzzerClassifier):
     """Loads the dataset and builds three DISJOINT, group-aware partitions:
 
         proper-train  : fits TF-IDF + calibrated classifier
@@ -224,11 +315,6 @@ class PhishFuzzerDatasetAdapter:
             self._fit_models(class_conditional)
 
     # ------------------------------------------------------------------ modelling
-    def _featurize(self, frame: pd.DataFrame):
-        tfidf = self.vectorizer.transform(frame['full_text'])
-        struct = extract_structural_features(frame)
-        return hstack([tfidf, csr_matrix(struct)]).tocsr()
-
     def _fit_models(self, class_conditional: bool):
         self.vectorizer = TfidfVectorizer(
             max_features=cfg.dataset.tfidf_max_features, stop_words='english', ngram_range=(1, 2))
@@ -304,37 +390,6 @@ class PhishFuzzerDatasetAdapter:
         if 'valid' in lbl or 'legit' in lbl or 'benign' in lbl:
             return "VALID"
         return "QUARANTINE"
-
-    def classify_text(self, text: str) -> Dict[str, Any]:
-        """Classify a new email using the same subject/body and structural features as training."""
-        if self.router is None or self.ml_classifier is None or self.vectorizer is None:
-            raise RuntimeError("Models not fitted (fit_models=False)")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("Email text must not be empty")
-        fields = {"Subject": "", "Body": text, "Sender": "", "Url": "", "File": ""}
-        header, separator, body = text.partition("\n\n")
-        names = {"subject": "Subject", "sender": "Sender", "from": "Sender",
-                 "links": "Url", "url": "Url", "attachments": "File", "file": "File"}
-        parsed = {}
-        for line in header.splitlines():
-            name, colon, value = line.partition(":")
-            if not colon or name.strip().lower() not in names:
-                parsed = {}
-                break
-            parsed[names[name.strip().lower()]] = value.strip()
-        if separator and parsed:
-            fields.update(parsed)
-            fields["Body"] = re.sub(r"^Body:\s*\n?", "", body, count=1, flags=re.IGNORECASE)
-        frame = pd.DataFrame([fields])
-        frame["full_text"] = frame["Subject"] + "\n" + frame["Body"]
-        probs = self.ml_classifier.predict_proba(self._featurize(frame))[0]
-        decision = self.router.predict_one(probs)
-        return {
-            "ml_predicted_class": self.classes[int(np.argmax(probs))],
-            "ml_probs": {c: float(p) for c, p in zip(self.classes, probs)},
-            "conformal_set": list(decision.prediction_set),
-            "conformal_singleton": decision.is_singleton,
-        }
 
     def load_as_test_items(self, sample_fraction: float = None, seed: int = None,
                            high_bound: float = None, low_bound: float = None) -> List[Dict[str, Any]]:

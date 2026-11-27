@@ -1,6 +1,6 @@
 import pytest
 
-from src.input_parsers import parse_csv_samples, parse_json_samples
+from src.input_parsers import parse_csv_samples, parse_html_text, parse_json_samples
 
 
 def test_json_parser_accepts_bom_envelopes_strings_and_metadata():
@@ -38,3 +38,24 @@ def test_csv_parser_handles_bom_fallback_and_metadata():
 
 def test_csv_parser_returns_no_samples_for_header_only_input():
     assert parse_csv_samples(b"text,email\n") == []
+
+
+def test_html_extracts_visible_text_and_link_targets_without_scripts():
+    text = parse_html_text(
+        b'<html><head><title>hidden</title><style>secret</style></head>'
+        b'<body><p>Verify &amp; sign in <a href="https://evil.example/login?a=1&amp;b=2">'
+        b'Account</a></p><script>do_not_run()</script>'
+        b'<form action="https://evil.example/submit">Continue</form></body></html>'
+    )
+    assert "Verify & sign in" in text
+    assert "Account" in text
+    assert "https://evil.example/login?a=1&b=2" in text
+    assert "https://evil.example/submit" in text
+    assert "hidden" not in text and "secret" not in text and "do_not_run" not in text
+
+
+def test_html_decodes_declared_charset_and_handles_empty_documents():
+    assert "café" in parse_html_text(
+        b'<meta charset="windows-1252"><p>caf\xe9</p>'
+    )
+    assert parse_html_text(b"<html><body></body></html>") == ""
