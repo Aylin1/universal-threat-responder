@@ -12,7 +12,9 @@ import adapters.phishfuzzer_loader
 import adapters.rag_spam_adapter
 import langchain_ollama
 import rapidocr_onnxruntime
+import scripts.ingest_threat_intel
 import src.core
+import src.dashboard_index
 
 
 class Upload(io.BytesIO):
@@ -39,6 +41,8 @@ def dashboard(monkeypatch):
     monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", lambda: ocr)
     monkeypatch.setattr(adapters.phishfuzzer_loader, "load_classifier", lambda _: classifier)
     monkeypatch.setattr(adapters.rag_spam_adapter, "RAGSpamAdapter", lambda **_: adapter)
+    monkeypatch.setattr(src.dashboard_index, "prepare_dashboard_index", lambda source, target: target)
+    monkeypatch.setattr(scripts.ingest_threat_intel, "sync_ioc_snapshot", lambda **_: None)
     monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **_: None)
     monkeypatch.setattr(src.core, "SecurityTools", lambda **_: None)
     monkeypatch.setattr(src.core, "ThreatResponderGraph", lambda **_: graph)
@@ -95,3 +99,29 @@ def test_pdf_upload_still_uses_digital_text(monkeypatch, dashboard):
     ocr.assert_not_called()
     classifier.classify_text.assert_called_once_with("Digital PDF text")
     assert adapter.build_context.call_args.kwargs["metadata"]["source"] == "pdf_upload"
+
+
+def test_dashboard_refreshes_feeds_and_uses_retrieval(monkeypatch, dashboard):
+    _, _, adapter = dashboard
+    factory = MagicMock(return_value=adapter)
+    refresh = MagicMock()
+    monkeypatch.setattr(adapters.rag_spam_adapter, "RAGSpamAdapter", factory)
+    monkeypatch.setattr(scripts.ingest_threat_intel, "sync_ioc_snapshot", refresh)
+    app = run_upload(monkeypatch, None)
+
+    assert not app.exception
+    refresh.assert_called_once_with(refresh=True, limit=2000, require_fresh=True)
+    factory.assert_called_once_with(milvus_uri=str(Path("data/dashboard_rag.db")))
+
+
+def test_dashboard_reports_feed_refresh_failure(monkeypatch, dashboard):
+    factory = MagicMock()
+    monkeypatch.setattr(adapters.rag_spam_adapter, "RAGSpamAdapter", factory)
+    monkeypatch.setattr(
+        scripts.ingest_threat_intel, "sync_ioc_snapshot",
+        MagicMock(side_effect=RuntimeError("Could not fetch fresh feeds")),
+    )
+    app = run_upload(monkeypatch, None)
+
+    assert any("Could not fetch fresh feeds" in error.message for error in app.exception)
+    factory.assert_not_called()

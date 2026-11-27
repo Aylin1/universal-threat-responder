@@ -7,6 +7,7 @@ from src.ioc import IOCIndex, normalize_url
 from src.metrics import (bootstrap_ci, brier_score, distribution_entropy, expected_calibration_error,
                          l2_to_cosine_similarity, top2_margin)
 from evals.analyze_results import summarize, to_markdown
+from scripts import ingest_threat_intel
 
 
 # ----------------------------------------------------------------------------- metrics
@@ -74,6 +75,28 @@ def test_ioc_roundtrip_from_json(tmp_path):
     p = tmp_path / "f.json"
     p.write_text(json.dumps({"fetched_at": "t", "records": [{"url": "http://a.test/x", "indicator_id": "I1"}]}))
     assert len(IOCIndex.from_json(str(p))) == 1
+
+
+def test_fresh_feed_replaces_existing_snapshot(tmp_path, monkeypatch):
+    snapshot = tmp_path / "feed.json"
+    snapshot.write_text('{"records": [{"url": "http://old.test"}]}')
+    monkeypatch.setattr(ingest_threat_intel, "fetch_openphish", lambda limit: [{"url": "http://new.test"}])
+    monkeypatch.setattr(ingest_threat_intel, "fetch_urlhaus", lambda limit: [])
+    ingest_threat_intel.sync_ioc_snapshot(True, 2000, str(snapshot), require_fresh=True)
+    assert json.loads(snapshot.read_text())["records"] == [{"url": "http://new.test"}]
+
+
+def test_fresh_feed_failure_does_not_use_or_destroy_old_snapshot(tmp_path, monkeypatch):
+    import pytest
+
+    snapshot = tmp_path / "feed.json"
+    old = '{"records": [{"url": "http://old.test"}]}'
+    snapshot.write_text(old)
+    monkeypatch.setattr(ingest_threat_intel, "fetch_openphish", lambda limit: [])
+    monkeypatch.setattr(ingest_threat_intel, "fetch_urlhaus", lambda limit: [])
+    with pytest.raises(RuntimeError, match="fresh threat intelligence"):
+        ingest_threat_intel.sync_ioc_snapshot(True, 2000, str(snapshot), require_fresh=True)
+    assert snapshot.read_text() == old
 
 
 # ----------------------------------------------------------------------------- analysis

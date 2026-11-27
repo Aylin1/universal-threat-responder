@@ -1,6 +1,8 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.dashboard-venv/
+.dashboard-setup.lock
 .benchmarks/
 .deepeval/
 logs/

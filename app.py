@@ -1,5 +1,6 @@
 import io
 import hashlib
+from pathlib import Path
 import random
 import streamlit as st
 
@@ -18,8 +19,10 @@ from langchain_ollama import ChatOllama
 from adapters.phishfuzzer_loader import load_classifier
 from adapters.rag_spam_adapter import RAGSpamAdapter
 from src.core import ThreatResponderGraph, SecurityTools
+from src.dashboard_index import prepare_dashboard_index
 from src.domain_interface import ThreatSignal
 from src.input_parsers import parse_csv_samples, parse_html_text, parse_json_samples
+from scripts.ingest_threat_intel import sync_ioc_snapshot
 from config import cfg
 
 st.set_page_config(page_title="Universal Threat Responder", page_icon="🛡️", layout="wide")
@@ -30,10 +33,9 @@ st.markdown("Test your threat intelligence and classification engine interactive
 @st.cache_resource
 def load_threat_engine():
     classifier = load_classifier(cfg.dataset.classifier_path)
-    adapter = RAGSpamAdapter(
-        milvus_uri=cfg.vector_store.uri,
-        collection_name=getattr(cfg.vector_store, "phishing_collection", "phishing_threat_intel")
-    )
+    sync_ioc_snapshot(refresh=True, limit=2000, require_fresh=True)
+    index = prepare_dashboard_index(Path("rag_index"), Path("data/dashboard_rag.db"))
+    adapter = RAGSpamAdapter(milvus_uri=str(index))
     llm = ChatOllama(
         model=cfg.llm.model_name, 
         temperature=cfg.llm.temperature, 
@@ -127,7 +129,7 @@ def extract_png_text_diagnostic(file_bytes: bytes) -> str:
         st.error(f"❌ PNG OCR Extraction Error: {error}")
         return ""
 
-with st.spinner("Initializing Milvus vector database and local LLM graph..."):
+with st.spinner("Refreshing threat intelligence and preparing models and retrieval..."):
     adapter, agent, classifier = load_threat_engine()
 
 # Sidebar Telemetry View
@@ -135,6 +137,7 @@ st.sidebar.header("Engine Telemetry Configuration")
 st.sidebar.text("Policy: ML + LLM agreement and conformal singleton")
 st.sidebar.text("Fast-Path Enabled: False")
 st.sidebar.text(f"Model: {cfg.llm.model_name}")
+st.sidebar.text("Historical retrieval: enabled")
 
 email_text = ""
 samples = []
@@ -347,13 +350,6 @@ if analyze_requested:
                 st.write(f"**Conformal set:** {context['conformal_set']}")
                 st.write(f"**LLM prediction:** {decision.metadata.get('llm_raw_action', 'Unavailable')}")
                 st.write(f"**Threat-feed URL hits:** {context.get('ioc_hits', 0)}")
-
-                st.write("**Top relevant policy patterns (up to 3):**")
-                policies = context.get("review_policies", [])
-                if policies:
-                    st.dataframe(policies, use_container_width=True)
-                else:
-                    st.warning("No policy patterns met the relevance threshold.")
 
                 st.write("**Decision Metadata:**")
                 st.json(decision.metadata)

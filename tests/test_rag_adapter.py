@@ -71,6 +71,30 @@ def test_ioc_exact_hit_populates_context(make_adapter):
     assert ctx["ioc_hits"] == 1 and "OPENPHISH-1" in ctx["allowed_citation_ids"]
 
 
+def test_dashboard_mode_uses_iocs_without_embeddings_or_milvus(monkeypatch, tmp_path):
+    snapshot = tmp_path / "ioc.json"
+    snapshot.write_text(json.dumps({"records": [
+        {"indicator_id": "OPENPHISH-1", "url": "https://bad.test/a", "source": "openphish_live"},
+    ]}))
+    monkeypatch.setattr(mod, "HuggingFaceEmbeddings", lambda **kw: pytest.fail("Unexpected embedding model"))
+    monkeypatch.setattr(mod, "Milvus", lambda **kw: pytest.fail("Unexpected vector store"))
+    adapter = mod.RAGSpamAdapter(ioc_path=str(snapshot), retrieval_enabled=False)
+    ctx = adapter.build_context("click https://bad.test/a")
+    assert ctx["ioc_hits"] == 1
+    assert ctx["neighbors"] == [] and ctx["pattern_matches"] == []
+    assert "OPENPHISH-1" in ctx["allowed_citation_ids"]
+    assert "retrieval is disabled" in adapter._format_neighbors(ctx)
+
+
+@pytest.mark.parametrize("contents", [None, '{"records": []}'])
+def test_dashboard_mode_rejects_missing_or_empty_feed(tmp_path, contents):
+    snapshot = tmp_path / "ioc.json"
+    if contents is not None:
+        snapshot.write_text(contents)
+    with pytest.raises((FileNotFoundError, RuntimeError), match="snapshot is (missing|empty)"):
+        mod.RAGSpamAdapter(ioc_path=str(snapshot), retrieval_enabled=False)
+
+
 def test_strict_mode_raises_instead_of_silently_returning_no_context(make_adapter):
     with pytest.raises(RuntimeError, match="populate_phishing_vectorstore"):
         make_adapter(fail=True).build_context("hello")

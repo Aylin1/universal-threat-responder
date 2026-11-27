@@ -24,8 +24,9 @@ are also reviewed when the final classification is not PHISHING. The LLM prompt 
 the ML prediction; agreement does not imply independent evidence. The graph logs actions
 but does not actually deliver, block or isolate email, nor does it provide an analyst queue.
 
-The dashboard fits the classifier on the configured PhishFuzzer split at startup. The
-classifier and conformal router are not a general-purpose trained production model. Raw
+The dashboard loads a saved classifier and a prebuilt retrieval index rather than training
+or indexing at startup. The classifier and conformal router are not a general-purpose
+trained production model. Raw
 inputs without recognizable email headers are treated as body text; missing sender,
 link and attachment fields limit the available structural features.
 

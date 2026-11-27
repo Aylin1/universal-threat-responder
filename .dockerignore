@@ -1,0 +1,15 @@
+**
+!requirements.txt
+!app.py
+!config.py
+!adapters/
+!adapters/**
+!scripts/
+!scripts/**
+!src/
+!src/**
+!models/
+!models/phishfuzzer_classifier.joblib
+!rag_index/
+!rag_index/**
+**/__pycache__/

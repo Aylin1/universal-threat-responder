@@ -1,0 +1,17 @@
+{
+ "collection": "email_history",
+ "dataset_path": "data/spam/PhishFuzzer_emails_entity_rephrased_v1.json",
+ "seed": 42,
+ "outer_fold": 0,
+ "n_docs": 15840,
+ "split_fingerprint": "0f8c596df4b20f8f57b3f5ec30427cbc3e298e2c",
+ "leakage_report": {
+  "grouping": "Original_ID",
+  "n_train": 15840,
+  "n_test": 3960,
+  "group_overlap": 0,
+  "exact_duplicate_overlap": 0,
+  "test_nn_cosine_mean": 0.4169412822920953,
+  "test_nn_cosine_ge_0.90_rate": 0.0002525252525252525
+ }
+}

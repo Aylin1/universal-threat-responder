@@ -1,0 +1,79 @@
+x-dashboard: &dashboard
+  build: .
+  ports:
+    - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
+  volumes:
+    - dashboard-data:/app/data
+    - dashboard-models:/app/models
+    - dashboard-logs:/app/logs
+    - dashboard-embeddings:/app/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3).read()"]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 1h
+
+x-ollama: &ollama
+  image: ollama/ollama:latest
+  volumes:
+    - ollama-models:/root/.ollama
+  healthcheck:
+    test: ["CMD", "ollama", "list"]
+    interval: 5s
+    timeout: 10s
+    retries: 12
+
+services:
+  dashboard:
+    <<: *dashboard
+    extra_hosts:
+      - "docker-host-gateway:host-gateway"
+    environment:
+      OLLAMA_HOST: http://${DASHBOARD_OLLAMA_ADDRESS:-host.docker.internal}:11434
+      NO_PROXY: host.docker.internal,docker-host-gateway,localhost,127.0.0.1
+      URLHAUS_AUTH_KEY: ${URLHAUS_AUTH_KEY:-}
+
+  dashboard-container:
+    <<: *dashboard
+    profiles: [container-ollama]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      NO_PROXY: ollama,localhost,127.0.0.1
+      URLHAUS_AUTH_KEY: ${URLHAUS_AUTH_KEY:-}
+
+  ollama:
+    <<: *ollama
+    profiles: [container-ollama]
+
+  dashboard-container-gpu:
+    <<: *dashboard
+    profiles: [container-ollama-gpu]
+    depends_on:
+      ollama-gpu:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama-gpu:11434
+      NO_PROXY: ollama-gpu,localhost,127.0.0.1
+      URLHAUS_AUTH_KEY: ${URLHAUS_AUTH_KEY:-}
+
+  ollama-gpu:
+    <<: *ollama
+    profiles: [container-ollama-gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama-models:
+  dashboard-data:
+  dashboard-models:
+  dashboard-logs:
+  dashboard-embeddings:

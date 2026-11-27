@@ -12,7 +12,8 @@ langchain-ollama>=0.1.0
 langchain-milvus>=0.1.0
 langchain-huggingface[full]>=0.0.1
 langgraph>=0.0.20
-pymilvus>=2.3.0
+pymilvus==3.0.3
+milvus-lite==3.2.2
 
 # Interactive Telemetry Dashboard
 streamlit>=1.30.0

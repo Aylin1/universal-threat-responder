@@ -61,6 +61,7 @@ class RAGSpamAdapter(DomainAdapter):
         distance_metric: str = "L2",
         strict: bool = True,
         collection_name: Optional[str] = None,   # legacy alias for history_collection
+        retrieval_enabled: bool = True,
     ):
         """
         strict=True  : a missing/empty collection raises instead of silently returning no context
@@ -76,29 +77,35 @@ class RAGSpamAdapter(DomainAdapter):
         self.ioc_index_path = ioc_path
         self.distance_metric = distance_metric.upper()
         self.strict = strict
+        self.retrieval_enabled = retrieval_enabled
         self.retrieval_errors = 0
 
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5",
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        if "://" not in milvus_uri:
-            local_dir = os.path.dirname(milvus_uri)
-            if local_dir:
-                os.makedirs(local_dir, exist_ok=True)
+        if retrieval_enabled:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="BAAI/bge-small-en-v1.5",
+                encode_kwargs={"normalize_embeddings": True},
+            )
+            if "://" not in milvus_uri:
+                local_dir = os.path.dirname(milvus_uri)
+                if local_dir:
+                    os.makedirs(local_dir, exist_ok=True)
 
-        conn = {"uri": milvus_uri}
-        self.history_store = Milvus(embedding_function=self.embeddings,
-                                    collection_name=self.history_collection,
-                                    connection_args=conn)
-        self.pattern_store = Milvus(embedding_function=self.embeddings,
-                                    collection_name=pattern_collection,
-                                    connection_args=conn)
-        self.vector_store = self.history_store  # legacy attribute name
+            conn = {"uri": milvus_uri}
+            self.history_store = Milvus(embedding_function=self.embeddings,
+                                        collection_name=self.history_collection,
+                                        connection_args=conn)
+            self.pattern_store = Milvus(embedding_function=self.embeddings,
+                                        collection_name=pattern_collection,
+                                        connection_args=conn)
+            self.vector_store = self.history_store  # legacy attribute name
 
         self.ioc_index: Optional[IOCIndex] = None
         if ioc_path and os.path.exists(ioc_path):
             self.ioc_index = IOCIndex.from_json(ioc_path)
+            if not retrieval_enabled and not self.ioc_index:
+                raise RuntimeError(f"Threat intelligence snapshot is empty: {ioc_path}")
+        elif not retrieval_enabled:
+            raise FileNotFoundError(f"Threat intelligence snapshot is missing: {ioc_path}")
         elif ioc_path:
             logger.warning("IOC feed snapshot %s not found; IOC matching disabled "
                            "(run scripts/ingest_threat_intel.py).", ioc_path)
@@ -173,7 +180,8 @@ class RAGSpamAdapter(DomainAdapter):
         ioc_host_hits = sum(1 for m in ioc_matches if m["match_type"] == "host")
 
         neighbors: List[Dict[str, Any]] = []
-        for doc, score in self._search(self.history_store, query, self.k_history, "history"):
+        history_results = self._search(self.history_store, query, self.k_history, "history") if self.retrieval_enabled else []
+        for doc, score in history_results:
             meta = doc.metadata or {}
             neighbors.append({
                 "label": meta.get("label") or normalize_label(meta.get("type", "")),
@@ -183,7 +191,8 @@ class RAGSpamAdapter(DomainAdapter):
         neighbors.sort(key=lambda n: -n["sim"])
 
         patterns: List[Dict[str, Any]] = []
-        for doc, score in self._search(self.pattern_store, query, self.k_patterns, "patterns"):
+        pattern_results = self._search(self.pattern_store, query, self.k_patterns, "patterns") if self.retrieval_enabled else []
+        for doc, score in pattern_results:
             sim = self._to_similarity(float(score))
             if sim < MIN_RELEVANT_SIMILARITY:
                 continue
@@ -218,6 +227,7 @@ class RAGSpamAdapter(DomainAdapter):
 
         return {
             "raw_input": raw_input,
+            "retrieval_enabled": self.retrieval_enabled,
             "ioc_matches": ioc_matches,
             "ioc_hits": ioc_url_hits,
             "ioc_host_hits": ioc_host_hits,
@@ -251,6 +261,8 @@ class RAGSpamAdapter(DomainAdapter):
     # ------------------------------------------------------------------ prompt
     @staticmethod
     def _format_neighbors(ctx: dict, limit: int = 3) -> str:
+        if ctx.get("retrieval_enabled") is False:
+            return "Historical email retrieval is disabled."
         rel = [n for n in ctx.get("neighbors", []) if n["sim"] >= MIN_RELEVANT_SIMILARITY][:limit]
         if not rel:
             return "No sufficiently similar labelled emails were found."
@@ -258,6 +270,8 @@ class RAGSpamAdapter(DomainAdapter):
 
     @staticmethod
     def _format_patterns(ctx: dict) -> str:
+        if ctx.get("retrieval_enabled") is False:
+            return "Policy pattern retrieval is disabled."
         pats = ctx.get("pattern_matches", [])
         if not pats:
             return "No matching policy pattern."

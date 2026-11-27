@@ -72,14 +72,18 @@ def fetch_urlhaus(limit: int) -> List[Dict[str, Any]]:
     return out
 
 
-def sync_ioc_snapshot(refresh: bool, limit: int, path: str = IOC_PATH) -> None:
+def sync_ioc_snapshot(refresh: bool, limit: int, path: str = IOC_PATH, require_fresh: bool = False) -> None:
     p = Path(path)
+    if require_fresh and not refresh:
+        raise ValueError("A fresh threat snapshot requires refresh=True.")
     if p.exists() and not refresh:
         snap = json.loads(p.read_text(encoding="utf-8"))
         print(f"[=] Using cached IOC snapshot ({len(snap.get('records', []))} records, "
               f"fetched {snap.get('fetched_at', '?')}). Pass --refresh-feeds to re-download.")
         return
     records = fetch_openphish(limit) + fetch_urlhaus(limit)
+    if not records and require_fresh:
+        raise RuntimeError("Could not fetch a non-empty fresh threat intelligence snapshot.")
     if not records and p.exists():
         print("[!] Refresh returned nothing; keeping the existing snapshot.")
         return

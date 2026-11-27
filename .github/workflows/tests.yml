@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt scikit-learn==1.9.0 xgboost==3.2.0
+      - name: Run focused unit and policy regression tests
+        run: >-
+          python -m pytest -q
+          tests/test_agreement_review.py
+          tests/test_conformal_and_guard.py
+          tests/test_core_and_adapter.py
+          tests/test_metrics_ioc_analysis.py
+          tests/test_rag_adapter.py
+          tests/test_dashboard_upload.py
+          tests/test_dashboard_launcher.py
+          tests/test_loader_splits.py
